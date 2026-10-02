@@ -1,0 +1,11 @@
+# 仓库里一律存 LF。
+#
+# Windows 的 git 默认 core.autocrlf=true，会在「检出时把 LF 变成 CRLF」。
+# 对 Python 来说这不只是难看：CRLF 混进 .lnk 字节扫描的测试数据、
+# 或者让「这个文件到底几行」的对不上。所以在这里钉死，避免依赖每个
+# 克隆者的本地配置。
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
+*.pyc binary

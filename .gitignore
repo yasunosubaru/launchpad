@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 测试产物
+# tools/shots/ 里的截图是**真实启动器的原图**，含本机所有应用的名字。
+# 任何基于 grep 的扫描都看不到这一点（二进制），所以必须靠 .gitignore 挡住。
+tools/shots/
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# assets/ 里的东西都**要**提交：launchpad.ico 是程序用的图标，
+# icon-*.png 是各尺寸的源，_contact_sheet.png 是它们在浅底/深底上的
+# 对照图（由 make_icon.py 生成，但内容纯净且对 review 有用 ——
+# 看图不用先跑一遍 Python）。所以这里不写任何针对 assets/ 的规则。
+#
+# 踩过的坑：曾经写 `assets/_contact_sheet.png` 想忽略对照图，又写了
+# `!assets/*.png` 想保住图标。反向规则的优先级**高于**前面的忽略规则，
+# 结果把对照图自己放行回来了 —— 而 gitignore 只对未跟踪文件生效，
+# 一旦进了索引就再也忽略不掉。现在干脆全部提交，没有歧义。
