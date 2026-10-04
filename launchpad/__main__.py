@@ -162,11 +162,16 @@ def main() -> int:
     # 钩子装不上（策略限制、其它程序占用）不是致命错误，打印一句就继续。
     try:
         from launchpad.wheelhook import WheelHook
-        hook = WheelHook(on_wake=lambda: win.show_me(),
-                         is_showing=lambda: win.is_showing())
+        hook = WheelHook(
+            on_wake=lambda: win.show_me(),
+            is_showing=lambda: win.is_showing(),
+            flick_delta=120 * settings.get("wake_notches"),
+            edge_px=settings.get("wake_edge_px"))
         if hook.start():
             win._wheelhook = hook
-            print(f"[WheelHook] 触控板手势唤出已启用（{hook.stats()}）")
+            print(f"[WheelHook] 触控板手势唤出已启用："
+                  f"从屏幕左右边缘 {hook.edge_px}px 内滑入，"
+                  f"快速滑 {settings.get('wake_notches')} 格")
         else:
             print(f"[WheelHook] 未启用：热键/托盘仍可用")
     except Exception as exc:

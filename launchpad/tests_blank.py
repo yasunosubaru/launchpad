@@ -83,6 +83,19 @@ class FakeEntry:
         self.args = ""
         self.workdir = ""
         self.missing = False
+        # Entry 的显示层契约：label = 自定义名优先，否则原名。
+        # Tile 构造时读的是 label（改名功能的显示入口），没有它会 AttributeError。
+        # 这里照抄 library.Entry.label 的语义，而不是随便给个属性 ——
+        # 夹具与真条目不一致时，测试就是在测一个不存在的东西。
+        self.display = ""
+
+    @property
+    def label(self):
+        return self.display.strip() or self.name
+
+    @property
+    def renamed(self):
+        return bool(self.display.strip()) and self.display.strip() != self.name
 
 
 # ══════════════════════════════════════════════════════════════
@@ -463,8 +476,14 @@ check("右键图标中心 → 弹的是**图标**菜单（不是空白菜单）"
 _txt = _menus_shown[0][1] if _menus_shown else []
 check("图标菜单首项是应用名（灰字标题）", bool(_txt) and "App" in _txt[0],
       str(_txt))
-check("「从启动器移除」紧跟标题之后",
-      len(_txt) > 1 and _txt[1] == "从启动器移除", str(_txt))
+# 原来这里断言的是「移除紧跟标题之后」。现在标题之后是
+# 「重命名…」（不破坏性，常用），移除在其后、分隔线之前。
+# 新意图：菜单里最容易被误点到的位置，应该落在最难恢复的那一项上。
+check("「重命名…」在标题之后（不破坏性的排最前）",
+      len(_txt) > 1 and _txt[1] == "重命名…", str(_txt))
+check("「从启动器移除」在重命名之后、分隔线之前",
+      len(_txt) > 2 and _txt[2] == "从启动器移除"
+      and (len(_txt) < 4 or _txt[3] == ""), str(_txt))
 check("图标菜单也有「添加应用」",
       any("添加应用" in t for t in _txt), str(_txt))
 

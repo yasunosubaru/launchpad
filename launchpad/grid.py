@@ -77,6 +77,8 @@ class Grid(QWidget):
     about_requested = pyqtSignal()       # 「关于 Launchpad」
     #: 右键点到图标 → 要把它从启动器移除。载荷是那个 Entry。
     delete_requested = pyqtSignal(object)
+    #: 右键点到某个图标 → 要给它改名。载荷是那个 Entry。
+    rename_requested = pyqtSignal(object)
 
     def __init__(self, library: Library, icons: IconCache,
                  columns: int = 7, rows: int = 5, parent=None,
@@ -166,6 +168,9 @@ class Grid(QWidget):
         # 「关于」是菜单里看得见却点了没反应的一项，比没有更糟。
         self._blank.about_requested.connect(self.about_requested.emit)
         self._blank.delete_requested.connect(self.delete_requested.emit)
+        # 改名同理：blankarea 里有定义、有发射点，Grid 不转发的话
+        # 主窗口就收不到 —— 菜单里有这项、点了没反应。
+        self._blank.rename_requested.connect(self.rename_requested.emit)
 
         # 立刻填上全部条目，不等外部调用。
         self._populate()
@@ -346,6 +351,31 @@ class Grid(QWidget):
             return
         self._pending_build = False
         self.rebuild()
+
+    def invalidate_tiles(self) -> None:
+        """让下一次 :meth:`set_search` 无条件重建。
+
+        ## 为什么需要它
+
+        ``set_search`` 的「结果没变就不重建」是为了热键唤出那条最高频路径 ——
+        比较用**对象身份**，因为库里的 Entry 在两次调用之间不会换（只有
+        ``reload`` 才会）。
+
+        但**改名是就地改字段**：``Entry.display`` 变了，而对象还是同一个。
+        于是 query 相同、命中数相同、身份全相同 -> 判定「没变」-> **不重建**
+        -> Tile 上还是旧名字。
+
+        症状：改名后提示条说「已改名为 X」，界面上的字却纹丝不动。
+        而 ``window._rename_entry`` 当时的注释恰好写着「走 set_search 的
+        重建路径就行」—— 那句话是错的，且被这条 bug 印证。
+
+        **不要**改成把 label 纳入比较：那等于让每次按热键都对 116 个条目做
+        字符串比较，正是上面那段注释在避免的开销。这里给出显式失效的口子，
+        由「确实改了条目内容」的那一方来调。
+
+        其它可能的调用方：将来任何就地修改 Entry 并需要界面跟着变的地方。
+        """
+        self._last_built_query = None
 
     def set_search(self, query: str, pinyin=None) -> None:
         """按搜索词过滤并重建。

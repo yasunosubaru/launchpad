@@ -742,7 +742,7 @@ class IconCache(QObject):
 
         image, origin, native = self._extract(entry, cands)
         if image is None or image.isNull():
-            self._remember(entry, key, self._placeholder(entry.name),
+            self._remember(entry, key, self._placeholder(entry.label),
                            origin="placeholder",
                            reason=self._diagnose(entry, cands))
         else:

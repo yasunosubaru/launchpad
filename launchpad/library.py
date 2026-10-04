@@ -23,6 +23,7 @@ APP_DIR = "Launchpad"
 
 # 路径集中在 paths.py，其它模块一律从那里取，避免字符串散落各处。
 from .paths import dismissed_file as _dismissed_file    # noqa: E402
+from .paths import renames_file as _renames_file        # noqa: E402
 from .paths import icon_dir as _icon_dir                # noqa: E402
 
 
@@ -40,6 +41,10 @@ def db_file() -> Path:
 
 def dismissed_db_file() -> Path:
     return _dismissed_file()
+
+
+def renames_db_file() -> Path:
+    return _renames_file()
 
 
 def icon_dir() -> Path:
@@ -68,10 +73,30 @@ class Entry:
     source_lnk: str = ""             # 原始 .lnk 路径，可回溯
     keywords: List[str] = field(default_factory=list)   # 搜索用别名
     missing: bool = False            # 目标读不出或已不存在
+    # 用户自定义的显示名。**空串 = 用原名 name。**
+    # 磁盘上的真相是 renames.json（uid -> 显示名），这里只是物化缓存：
+    # load() 和 import_folder() 会重新贴回来。见 paths.renames_file 的说明。
+    display: str = ""
     # 最近一次成功启动的 epoch 秒，0 = 从未用过。
     # 排序方式 recent 依赖它。to_dict/from_dict 都走 dataclass 字段反射，
     # 所以加了这个字段就自动往返，不需要改序列化代码。
     last_used: float = 0.0
+
+    @property
+    def label(self) -> str:
+        """
+        **界面上要显示的名字**：自定义名优先，没有就用原名。
+
+        这是显示的唯一真相来源。直接读 ``entry.name`` 的地方一律要改成
+        读这个 —— 否则改名对某些路径不生效，而那种「有的地方改了有的地方
+        没改」的半吊子状态最难排查。
+        """
+        return self.display.strip() or self.name
+
+    @property
+    def renamed(self) -> bool:
+        """是否被用户改过名（决定要不要在菜单里给「还原原名」）。"""
+        return bool(self.display.strip()) and self.display.strip() != self.name
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -185,18 +210,31 @@ def scan_folder(folder: Path) -> tuple[List[Entry], List[str]]:
 
 class Library:
     def __init__(self, path: Path | None = None,
-                 dismissed_path: Path | None = None):
+                 dismissed_path: Path | None = None,
+                 renames_path: Path | None = None):
         self.path = Path(path) if path else db_file()
         # 墓碑清单。测试里会传临时路径，否则会污染用户真实的 dismissed.json。
         self.dismissed_path = (Path(dismissed_path) if dismissed_path
                                else dismissed_db_file())
+        # 自定义名清单。理由同上：测试必须能传临时路径。
+        self.renames_path = (Path(renames_path) if renames_path
+                             else renames_db_file())
         self.entries: List[Entry] = []
         #: 用户主动删掉的条目 uid。见 paths.dismissed_file 的说明。
         self.dismissed: set[str] = set()
+        #: uid -> 自定义显示名。见 paths.renames_file 的说明。
+        self.renames: dict[str, str] = {}
+        #: 两张表是否已经从磁盘读过。没读过就导入是**危险**的：
+        #: ``import_folder`` 会拿着空的墓碑/改名表去判断，于是用户
+        #: 删掉的条目复活、改过的名字被冲掉 —— 正好是这两张表
+        #: 存在的理由。见 :meth:`_ensure_side_tables`。
+        self._side_tables_loaded = False
 
     # ── 读 ──
     def load(self) -> None:
         self.dismissed = self._load_dismissed()
+        self.renames = self._load_renames()
+        self._side_tables_loaded = True
         if not self.path.exists():
             self.entries = []
             return
@@ -221,6 +259,9 @@ class Library:
             except (TypeError, ValueError) as exc:
                 # 单条坏掉就跳过，不让整库报废
                 print(f"[Library] 跳过无法解析的条目: {exc}")
+        # 名字覆盖要在条目都读完之后贴：entry.load 走的是磁盘上的 name，
+        # 自定义名是另一份文件里的第二真相。
+        self.apply_renames()
 
     # ── 墓碑 ──────────────────────────────────────────────
     def _load_dismissed(self) -> set[str]:
@@ -259,6 +300,106 @@ class Library:
 
     def is_dismissed(self, entry: Entry) -> bool:
         return entry.uid in self.dismissed
+
+    # ── 自定义名 ──────────────────────────────────────────
+    #
+    # 纪律与 remove() 完全一致：**先落盘、再改内存**，落盘失败就回滚内存并
+    # 返回 False。理由是内存和磁盘分家之后，用户看到「界面上改了、重启又
+    # 变回去」—— 而那正好是这个功能要解决的问题本身。
+
+    def _load_renames(self) -> dict:
+        try:
+            if not self.renames_path.exists():
+                return {}
+            raw = json.loads(self.renames_path.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            print(f"[Library] 自定义名清单读不了，按空处理: {exc}")
+            return {}
+        if not isinstance(raw, dict):
+            print(f"[Library] 自定义名清单顶层应为对象，实际 "
+                  f"{type(raw).__name__}，按空处理")
+            return {}
+        return {str(k): str(v).strip()
+                for k, v in raw.items()
+                if isinstance(k, str) and k and isinstance(v, str)
+                and v.strip()}
+
+    def _save_renames(self) -> bool:
+        """落盘。返回是否成功 —— 调用方据此决定要不要回滚内存。"""
+        try:
+            self.renames_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(self.renames, ensure_ascii=False, indent=2)
+            tmp = self.renames_path.with_suffix(".json.tmp")
+            tmp.write_text(payload, encoding="utf-8", newline="\n")
+            os.replace(tmp, self.renames_path)
+            return True
+        except OSError as exc:
+            print(f"[Library] 自定义名清单写入失败: {exc}")
+            return False
+
+    def apply_renames(self) -> None:
+        """把 ``renames`` 贴到内存条目上（``display`` 字段）。
+
+        load() 与 import_folder() 都要调 —— 这两个是「重建了 Entry 对象」
+        的地方，也就是自定义名唯一会丢的地方。
+        """
+        if not self.renames:
+            return
+        for e in self.entries:
+            new = self.renames.get(e.uid)
+            if new:
+                e.display = new
+
+    def rename(self, uid: str, new_name: str) -> bool:
+        """
+        给 ``uid`` 起自定义名。``new_name`` 为空 = 还原原名。
+
+        返回是否成功。**磁盘上的 ``.lnk`` 一个字节都不动** —— 与「移除」
+        同一套语义：那个 .lnk 可能同时出现在开始菜单和其它地方，改它是
+        越权，而且几乎肯定不是用户的意思。
+
+        uid 查不到、或落盘失败，都返回 False 且**不改内存**。
+        """
+        # 落盘前必须确保读过：renames 若是空字典，_save_renames 会把磁盘上
+        # 已有的改名记录**整个覆盖掉** —— 那些名字于是全部恢复原样，而
+        # 文件本身也只剩这一条。
+        self._ensure_side_tables()
+        target = None
+        for e in self.entries:
+            if e.uid == uid:
+                target = e
+                break
+        if target is None:
+            print(f"[Rename] 库里没有 uid={uid} 的条目，忽略")
+            return False
+
+        new_name = (new_name or "").strip()
+        old_display = target.display
+        was_renamed = uid in self.renames
+        old_saved = self.renames.get(uid)
+
+        if new_name:
+            self.renames[uid] = new_name
+        else:
+            self.renames.pop(uid, None)
+        if not self._save_renames():
+            # 回滚：磁盘没变，内存也不能变
+            if was_renamed:
+                self.renames[uid] = old_saved
+            else:
+                self.renames.pop(uid, None)
+            return False
+
+        target.display = new_name
+        return True
+
+    def reset_name(self, uid: str) -> bool:
+        """还原成 .lnk 里的原名。"""
+        return self.rename(uid, "")
+
+    def custom_name(self, uid: str) -> str:
+        """当前的自定义名（没有就返回空串）。给「还原原名」菜单项判断用。"""
+        return self.renames.get(uid, "")
 
     # ── 写 ──
     def save(self) -> None:
@@ -311,6 +452,7 @@ class Library:
         落盘失败时**向上抛**，由调用方（window._delete_entry）处理。
         这里吞掉异常返回 True 会让界面以为删成功了。
         """
+        self._ensure_side_tables()
         original = self.entries
         kept = [e for e in original if e.uid != uid]
         if len(kept) == len(original):
@@ -344,6 +486,27 @@ class Library:
             self.dismissed.discard(uid)
             self._save_dismissed()
 
+    def _ensure_side_tables(self) -> None:
+        """没从磁盘读过就补读一次（幂等）。
+
+        **这个洞是真实踩出来的。** ``import_folder`` 靠 ``self.dismissed``
+        和 ``self.renames`` 判断，但这两张表默认是**空字典** ——
+        只有 ``load()`` 才会去磁盘读。于是一个刚 ``Library()`` 出来、
+        直接就 ``import_folder`` 的调用方（测试、脚本、将来可能的任何
+        入口）拿到的是空的表，于是：
+
+        * 墓碑失效 -> 用户在界面上删掉的图标，在下一次导入后**全部回来**；
+        * 改名失效 -> 用户改过的名字，在重新导入后**被冲回原名**。
+
+        两个都是这两张表要解决的核心问题，却从另一个门又漏进来了。
+        所以判断之前先确保读过。
+        """
+        if self._side_tables_loaded:
+            return
+        self.dismissed = self._load_dismissed()
+        self.renames = self._load_renames()
+        self._side_tables_loaded = True
+
     # ── 导入 ──
     def import_folder(self, folder: Path) -> dict:
         """
@@ -354,6 +517,7 @@ class Library:
           * uid 在墓碑里          → 用户主动删过，别再塞回来
           * 上一批导入的同 uid     → 同一次扫描里的重复文件
         """
+        self._ensure_side_tables()
         found, errors = scan_folder(folder)
         existing = {e.uid for e in self.entries}
         added = skipped = dismissed = 0
@@ -368,6 +532,9 @@ class Library:
             self.entries.append(e)
             added += 1
         if added:
+            # 新建的 Entry 是从 .lnk 现读的，display 一定是空 —— 不贴回
+            # 的话，用户改过的名在「添加应用 → 浏览文件夹」之后就消失了。
+            self.apply_renames()
             self.save()
         return {"added": added, "skipped": skipped,
                 "dismissed": dismissed,
@@ -375,7 +542,14 @@ class Library:
 
     # ── 搜索 ──
     def search(self, query: str, pinyin=None) -> List[Entry]:
-        """名称 / 别名 / 拼音 首字母或全拼，全部小写比较。"""
+        """
+        名称 / 别名 / 拼音 首字母或全拼，全部小写比较。
+
+        **原名和自定义名都要搜。** 改名是「加一层显示名」，不是「覆盖原名」
+        ——磁盘上的 .lnk 一个字节都没动，它的原名也就还在。用户在开始菜单
+        里看到的是「微信」，他多半会拿「微信」来搜；只搜自定义名的话，
+        改完名就等于把这个应用从搜索里弄丢了。
+        """
         if not query:
             return list(self.entries)
         q = query.strip().lower()
@@ -384,14 +558,18 @@ class Library:
 
         hits = []
         for e in self.entries:
-            hay = [e.name.lower()]
+            hay = [e.name.lower(), e.display.strip().lower()]
             hay += [k.lower() for k in e.keywords]
-            if any(q in h for h in hay):
+            if any(q in h for h in hay if h):
                 hits.append(e)
                 continue
             if pinyin is None:
                 continue
-            for field_text in (e.name, " ".join(e.keywords)):
+            # 拼音对「原名 / 自定义名 / 别名」都算一遍
+            for field_text in (e.name, e.display.strip(),
+                               " ".join(e.keywords)):
+                if not field_text:
+                    continue
                 initials = "".join(
                     pinyin.lazy_pinyin(field_text, style=pinyin.Style.FIRST_LETTER)
                 ).lower()

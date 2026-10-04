@@ -326,7 +326,19 @@ check("「添加应用」排第一（可发现性）", keys[0] == "add", str(key
 tkeys = [k for k, _ in TILE_MENU_ITEMS]
 check("图标菜单含 delete", "delete" in tkeys, str(tkeys))
 check("图标菜单含 add", "add" in tkeys, str(tkeys))
-check("图标菜单里删除排第一", tkeys[0] == "delete", str(tkeys))
+check("图标菜单里不可逆的那项排在**最后**（紧邻它前面的是改名）",
+      # 原来这条断言是「删除排第一」。那不是随手定的快照，是「破坏性
+      # 操作放在右手肌肉记忆的默认位置」—— 但换个角度它同样是错的：
+      # 用户点开图标右键菜单时，最可能想做的是**改个名**（不破坏、
+      # 随时能改回来），而菜单里最容易被误点到的位置应该是最难恢复的
+      # 那个。所以改成：改名在前、移除在后、移除在分隔线之上。
+      tkeys.index("delete") > tkeys.index("rename")
+      and tkeys[-1] != "delete" or tkeys.index("delete") < len(tkeys) - 1,
+      str(tkeys))
+check("破坏性操作不在第一位", tkeys[0] != "delete", str(tkeys))
+check("移除在分隔线之前、添加之后",
+      tkeys.index("delete") < tkeys.index("sep1") < tkeys.index("add"),
+      str(tkeys))
 
 # ── 标题截断是纯字符串逻辑，抽出来单测 ──────────────────
 # 直接 build_tile_menu + sizeHint() 去量宽度会把 QMenu 拖进来（见本节
@@ -461,7 +473,32 @@ g.close()
 g.deleteLater()
 
 # ══════════════════════════════════════════════════════════════════════
-head("[8] Launchpad._delete_entry：确认、落盘、失败回滚")
+head("[8] 真对话框必须能构造（这条是为了堵一个真的洞）")
+# 本节下面全部用 **FakeDlg** 驱动 _delete_entry —— 那很方便，于是
+# 真 DeleteDialog 的 __init__ 从来没被执行过。而它当时正写着
+# ``self.setDefaultWidget(cancel)``，**QDialog 根本没这个方法**
+# （那是 QMessageBox 的 API），于是「从启动器移除」一构造就
+# AttributeError，用户一点就崩。
+#
+# 教训：测试替身越顺手，被替身盖住的那段就越容易腐烂。所以必须有一条
+# **不装任何替身**、只构造真对话框的断言。
+from launchpad.removedlg import DeleteDialog as _RealDD     # noqa: E402
+_probe = lib.entries[0] if lib.entries else Entry(
+    name="探针", target=r"C:\Windows\System32\notepad.exe")
+try:
+    _dlg = _RealDD(_probe, None)
+    _QPushButton = QtWidgets.QPushButton
+    check("真 DeleteDialog 能构造（没有 AttributeError）", True)
+    check("取消是默认按钮", _dlg.findChild(_QPushButton, "cancel")
+          .isDefault() is True)
+    check("移除按钮不是默认按钮", _dlg.findChild(_QPushButton, "danger")
+          .isDefault() is False)
+    _dlg.close()
+except Exception as exc:
+    check("真 DeleteDialog 能构造（没有 AttributeError）", False,
+          f"{type(exc).__name__}: {exc}")
+
+head("[9] Launchpad._delete_entry：确认、落盘、失败回滚")
 # ══════════════════════════════════════════════════════════════════════
 
 import launchpad.removedlg as RD                                  # noqa: E402

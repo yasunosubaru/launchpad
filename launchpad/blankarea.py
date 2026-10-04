@@ -543,7 +543,17 @@ def tile_label_width(tile, lines: int = 1) -> int:
         text = getattr(tile, "_cached_elided", None) or getattr(tile, "_name", None)
         if not text:
             entry = tile.entry
-            text = entry.name + ("  ⚠" if getattr(entry, "missing", False) else "")
+            # label 是显示的唯一真相（自定义名优先）。用 getattr 兜一层是因为
+            # 这里接受鸭子类型：测试和 bench 会传只有 name 的假条目，
+            # 真实 Entry 一定有 label。
+            #
+            # 注意这两行**必须在 if 里面**：`entry` 只在该分支里赋值。
+            # 写到 if 外面就会在 text 非空时等着用 `entry` 而能谈上来的
+            # 名字 -> NameError -> 被下面的 `except Exception: return 0` 吞掉。
+            # 后果是标签行宽度量出来 0 -> 整行被当成空白区 ->
+            # 点应用名会关掉启动器。这个 bug 是被 tests_blank 拓出来的。
+            _lbl = getattr(entry, "label", None) or getattr(entry, "name", "")
+            text = _lbl + ("  ⚠" if getattr(entry, "missing", False) else "")
         font = theme.label_font()
         shown = theme.elide(text, font, tile.width())
         from PyQt5.QtGui import QFontMetrics
@@ -636,7 +646,12 @@ MENU_ITEMS = (
 )
 
 #: 图标（Tile）上的右键菜单。key 与信号一一对应。
+#:
+#: 「重命名」排在「从启动器移除」**前面** —— 它是不破坏性的、常用的；
+#: 移除会写墓碑、有墓碑就再也回不来（只能手改 dismissed.json）。
+#: 菜单里把不可逆的那项放后面，是让人右手肌肉记忆里的默认位置落在安全项上。
 TILE_MENU_ITEMS = (
+    ("rename", "重命名…"),
     ("delete", "从启动器移除"),
     ("sep1", None),
     ("add", "添加应用…"),
@@ -742,6 +757,11 @@ class BlankAreaController(QObject):
     about_requested = pyqtSignal()
     #: 右键点到某个图标 → 要删它。载荷是那个 Entry 对象。
     delete_requested = pyqtSignal(object)
+    #: 右键点到某个图标 → 要给它改名。载荷是那个 Entry 对象。
+    #: 与 delete 分成两个信号而不是共用一个带参数的：两种动作的
+    #: **后果严重程度不同**（改名不破坏、移除会写墓碑），共用一个信号再
+    #: 靠载荷猜意图的话，加新动作时很容易把不可逆的那个挂错。
+    rename_requested = pyqtSignal(object)
 
     # 排版变化时置位；hit 前惰性重建，避免每次点击都重算
     _LAYOUT_EVENTS = (QEvent.Resize, QEvent.Move, QEvent.Show,
@@ -1082,7 +1102,9 @@ class BlankAreaController(QObject):
     def _dispatch_tile(self, key: str, entry) -> None:
         """图标菜单的动作分发。独立成方法是为了能被测试直接调用 ——
         ``_show_tile_menu_at`` 里那个 ``menu.exec_()`` 是模态阻塞的。"""
-        if key == "delete":
+        if key == "rename":
+            self.rename_requested.emit(entry)
+        elif key == "delete":
             self.delete_requested.emit(entry)
         elif key == "add":
             self.add_requested.emit()
@@ -1092,7 +1114,9 @@ class BlankAreaController(QObject):
         entry = self._entry_at(index)
         if entry is None:
             return None
-        name = getattr(entry, "name", "") or ""
+        # 菜单标题用 label（自定义名优先）而不是 name —— 用户刚改完名，
+        # 右键菜单里还写着旧名会很别扭。
+        name = getattr(entry, "label", "") or getattr(entry, "name", "") or ""
         menu, acts = build_tile_menu(self._host, name)
         pos = clamp_to_screen(global_pos, menu.sizeHint())
         key = self._pick_action(acts, menu, pos)

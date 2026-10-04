@@ -116,6 +116,21 @@ class MSLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class _MONITORINFO(ctypes.Structure):
+    """``MONITORINFO``。字段顺序/类型必须和 Win32 一致（cbSize 在最前）。"""
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", _RECT),
+        ("rcWork", _RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
 # ── Win32 API ────────────────────────────────────────────
 # 只建一次并缓存。hotkeys.py 每次进 wndproc 都重建一遍 argtypes，那在消息
 # 频率下没问题；**低级鼠标钩子是全系统每个鼠标事件的频率**（含移动），每次
@@ -154,6 +169,18 @@ def _api():
     u.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int,
                                  wintypes.WPARAM, wintypes.LPARAM]
     u.CallNextHookEx.restype = LRESULT
+
+    # 边缘判定用：取指针**所在那块显示器**的矩形。
+    #
+    # 为什么不用 GetSystemMetrics(SM_CXSCREEN)：那个给的是**主屏**宽度。
+    # 多显示器下指针在副屏上时，拿主屏宽度去比会得到完全错误的结论
+    # （副屏在主屏右边时 x 永远大于主屏宽度，于是「离右边缘 <= 40px」
+    # 恒为真，边缘限制形同虚设）。
+    u.MonitorFromPoint.argtypes = [_POINT, wintypes.DWORD]
+    u.MonitorFromPoint.restype = wintypes.HANDLE
+    u.GetMonitorInfoW.argtypes = [wintypes.HANDLE,
+                                  ctypes.POINTER(_MONITORINFO)]
+    u.GetMonitorInfoW.restype = wintypes.BOOL
 
     u.PostThreadMessageW.argtypes = [wintypes.DWORD, ctypes.c_uint,
                                      wintypes.WPARAM, wintypes.LPARAM]
@@ -225,36 +252,82 @@ class _Flick:
 
     语义（时间窗 sliding window + latch）：
 
-    - 相邻两次事件的间隔超过 ``window_ms`` ⇒ 前面的累积作废，从头算。
-      这是「滑动」和「慢慢滚」的分界：慢慢滚每 100ms 一次，永远攒不到 2 格。
+    - 相邻两次事件的间隔超过 ``window_ms`` ⇒ **手势结束**：累积量作废，
+      并且解除 latch。这是「滑动」和「慢慢滚」的分界：慢慢滚每 100ms 一格，
+      永远攒不到 2 格。
     - ``accum += abs(delta)``；``accum >= threshold`` 且未 latch ⇒ 触发一次，
       进入 latch。
-    - latch 期间只有 ``accum < release_at`` 才解开，``release_at = threshold/3``。
-      不这样的话一次长滚动（几十格）会一路触发。
+    - 一次长滚动（几十格）不该一路触发，latch 就是防这个的。
+
+    ## latch 曾经永远解不开（本文件第一版的真 bug）
+
+    第一版用「累积量回落到 ``threshold/3`` 以下」来解 latch::
+
+        if expired: self.accum = 0
+        self.accum += abs(delta)        # ← 复位后立刻又加
+        if self.latch and self.accum < self.release_at: self.latch = False
+
+    这两行是矛盾的：``accum`` 复位成 0 之后**马上**就被加上这一格的
+    ``abs(delta)``，而**一个滚轮刻度就是 120**，已经大于
+    ``release_at = threshold/3 = 80``。于是 ``accum`` 在数学上**永远**
+    降不到 80 以下 —— latch 一旦置上就再也解不开。
+
+    实测症状：不带 --show 启动（开机自启形态），第一次触控板滑动正常唤出，
+    **之后无论怎么滑都不再有任何反应**，直到重启程序。静默到用户只会
+    得出「这个功能时灵时不灵」。
+
+    正确的判据是**时间**而不是累积量：「用户停手了」的直接可观测量就是
+    「距上一个滚轮事件过去了多久」。手势窗口过期本身就是停手的证据，
+    不需要第二个阈值。
     """
 
-    __slots__ = ("threshold", "window_ms", "release_at",
-                 "accum", "latch", "_last_ms")
+    __slots__ = ("threshold", "window_ms", "accum", "latch", "_last_ms")
 
     def __init__(self, threshold: int, window_ms: int) -> None:
         self.threshold = threshold
         self.window_ms = window_ms
-        self.release_at = max(1, threshold // 3)
         self.accum = 0
         self.latch = False
         self._last_ms = -1          # -1 = 还没收到过事件
 
+    def is_start(self, now_ms: int) -> bool:
+        """
+        即将喂进来的这个事件是不是**手势的第一个**（即 ``feed`` 之后累积量
+        会从0 开始重新算）。
+
+        调用方需要在知道「本次手势是否刚起头」之后才决定要不要接受，
+        所以必须在 ``feed`` **之前**取。判据与 :meth:`feed` 里的窗口
+        过期判断保持一致：没收到过事件，或者距上次已超过 ``window_ms``。
+
+        **必须传 ``now_ms``。** 光看 ``_last_ms >= 0`` 是不够的 ——
+        那只能区分「第一个事件」和「后续事件」，区分不了「长时间停手后的
+        第一个事件」，而后者恰恰也是手势起点（还要解除 latch）。
+        """
+        return self._last_ms < 0 or (now_ms - self._last_ms) > self.window_ms
+
+    def discard(self) -> None:
+        """把本次手势作废（累积清零、解除 latch），不触发。
+
+        用于「判定为手势但条件不满足」的场景（比如起点不在屏幕边缘）——
+        那种情况下不应该让累积继续攒着，否则一个手势的前半段在边缘内、
+        后半段移出去时仍会触发，那不是用户想要的「从侧边滑入」。
+        """
+        self.accum = 0
+        self.latch = False
+
     def feed(self, delta: int, now_ms: int) -> bool:
         """吃一个滚轮事件，返回是否这次判定为一次唤出手势。"""
-        if self._last_ms >= 0 and now_ms - self._last_ms > self.window_ms:
-            self.accum = 0          # 时间窗过期，累积量作废
+        expired = (self._last_ms >= 0
+                   and (now_ms - self._last_ms) > self.window_ms)
+        if expired:
+            # 停手超过窗口 = 上一次手势结束：累积作废 + 允许下一次触发
+            self.accum = 0
+            self.latch = False
         self._last_ms = now_ms
         self.accum += abs(delta)
 
         if self.latch:
-            if self.accum < self.release_at:
-                self.latch = False  # 累积量回落了，允许下一次触发
-            return False
+            return False            # 本次手势已经触发过，不重复
         if self.accum >= self.threshold:
             self.latch = True
             return True
@@ -325,10 +398,13 @@ class WheelHook:
 
     def __init__(self, on_wake=None, is_showing=None, *,
                  flick_delta: int = 240, flick_ms: int = 250,
-                 ignore_injected: bool = True) -> None:
+                 ignore_injected: bool = True, edge_px: int = 40) -> None:
         self.on_wake = on_wake
         self.is_showing = is_showing
         self.ignore_injected = bool(ignore_injected)
+        #: 手势**起点**必须离所在显示器的左/右边缘不超过这么多像素。
+        #: 0 = 不限（全屏任何位置都算）。默认 40 —— 见 :meth:`_edge_ok`。
+        self.edge_px = max(0, int(edge_px))
 
         self._flick = _Flick(max(1, int(flick_delta)), max(1, int(flick_ms)))
         self._hook_proc = None       # HOOKPROC 实例，必须保活（见下方注释）
@@ -571,10 +647,54 @@ class WheelHook:
         if delta == 0:
             return
         now_ms = int(time.monotonic() * 1000)
-        if self._flick.feed(delta, now_ms):
+        flick = self._flick
+        started = flick.is_start(now_ms)
+        if flick.feed(delta, now_ms):
+            # 边缘判定只在**手势的第一个事件**上做：用户「从侧边滑进来」
+            # 的起点在那里，中途指针会跑到屏幕中间去。
+            if started and not self._edge_ok(hs.pt.x):
+                self._count("off_edge")
+                flick.discard()
+                return
             self._count_trigger(delta)
             bridge = self._bridge
             if bridge is not None:
                 # 唯一的跨线程动作，QueuedConnection 把它排到 GUI 线程。
                 # 真正的 on_wake 在 _Bridge._deliver 里，不在这里。
                 bridge.woken.emit()
+
+    def _edge_ok(self, x: int) -> bool:
+        """
+        手势起点是否落在屏幕侧边的「边缘带」里。
+
+        ## 为什么必须有这个限制
+
+        没有它的话，你在浏览器里**正常滚动**就会把启动器弹到页面上：
+        240 = 两格，而两指快滑在 250ms 内攒够两格是常事。这个钩子是
+        全系统的，任何程序里的一次快滑都会被看到。
+
+        限制成「从屏幕左侧/右侧边缘往里滑」之后就基本不会误触 ——
+        正常滚动时指针不会停在屏幕最边上，而从侧边滑入本来就是触控板
+        用户最熟悉的动作（macOS 的 hot corner / Launchpad 边缘唤出）。
+
+        ``edge_px = 0`` 表示不限制（全屏任何位置都算），对应设置里的
+        「0 = 不限」。
+
+        多显示器：用 ``MonitorFromPoint`` 取指针**所在那块屏**的矩形，
+        而不是主屏 —— 指针在副屏上时，主屏的宽度会给出完全错误的判断。
+        """
+        band = int(getattr(self, "edge_px", 0) or 0)
+        if band <= 0:
+            return True
+        u, _ = _api()
+        try:
+            hmon = u.MonitorFromPoint(
+                _POINT(int(x), 0), 2)          # 2 = MONITOR_DEFAULTTONEAREST
+            mi = _MONITORINFO()
+            mi.cbSize = ctypes.sizeof(_MONITORINFO)
+            if not u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                return True                    # 拿不到就放行，不拦用户
+            left, right = mi.rcMonitor.left, mi.rcMonitor.right
+        except Exception:
+            return True
+        return x - left <= band or right - x <= band

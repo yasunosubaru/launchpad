@@ -68,6 +68,12 @@ SCHEMA: dict[str, tuple] = {
     "wheel_gesture_ms":   (220, int, 80, 600),
     # 搜索
     "pinyin_search":      (True, bool, None, None),
+    # 触控板手势唤出：手势起点离屏幕侧边多少像素内才算数。0 = 不限。
+    # 不限的话，在浏览器里正常快速滚动两下就会把启动器弹到页面上 ——
+    # 240 = 两格，而两指快滑在 250ms 内攒够两格是常事。
+    "wake_edge_px":       (40, int, 0, 400),
+    # 手势需要累积多少滚轮刻度才唤出（120 = 一格）。调大 = 要滑更快更多。
+    "wake_notches":       (2, int, 1, 10),
 }
 
 LAYOUT_MODES = ("grid", "flow", "compact")

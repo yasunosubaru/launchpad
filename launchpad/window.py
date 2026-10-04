@@ -114,6 +114,7 @@ class Launchpad(QWidget):
         self.grid.settings_requested.connect(self._open_settings)
         self.grid.reload_requested.connect(self._reload_icons)
         self.grid.delete_requested.connect(self._delete_entry)
+        self.grid.rename_requested.connect(self._rename_entry)
         self.grid.about_requested.connect(self._show_about)
         self.grid.page_changed.connect(self._sync_dots)
         self.grid.pages_changed.connect(self._sync_dots)
@@ -392,7 +393,7 @@ class Launchpad(QWidget):
     def _launch(self, entry: Entry) -> None:
         if entry.missing:
             # 目标已失效，点了没反应只会让人以为程序坏了
-            self.grid._message = f"「{entry.name}」的目标已不存在，无法启动"
+            self.grid._message = f"「{entry.label}」的目标已不存在，无法启动"
             self.grid.update()
             return
 
@@ -410,7 +411,7 @@ class Launchpad(QWidget):
             ok, why = False, str(exc)
         if not ok:
             print(f"[Launch] 启动 {entry.name} 失败: {why}")
-            self.grid._message = f"「{entry.name}」无法启动：{why}"
+            self.grid._message = f"「{entry.label}」无法启动：{why}"
             self.grid.update()
             return
         self._mark_used(entry)
@@ -432,7 +433,7 @@ class Launchpad(QWidget):
         # 想要 macOS 那种「点一下就走」的行为：设置 → 行为 →
         # 打开「启动后收起启动器」。
         if not self.settings.get("hide_after_launch"):
-            self._announce_launch(entry.name)
+            self._announce_launch(entry.label)
         else:
             self.hide_me()
 
@@ -524,8 +525,18 @@ class Launchpad(QWidget):
             print(f"[Delete] 模块不可用: {exc}")
             return
 
-        dlg = DeleteDialog(entry, self)
-        if dlg.exec_() != DeleteDialog.Accepted:
+        try:
+            dlg = DeleteDialog(entry, self)
+            if dlg.exec_() != DeleteDialog.Accepted:
+                return
+        except Exception as exc:
+            # 整段兜住：这是用户点菜单进来的路径，对话框这一层出任何问题
+            # 都不该掀翻主程序。原来只在外面包了导入，构造和 exec_() 裸着 ——
+            # 真对话框的 __init__ 里就有个 setDefaultWidget 的 AttributeError
+            # （QDialog 根本没这个方法），一点「从启动器移除」就崩。
+            print(f"[Delete] 对话框失败: {exc}")
+            self.grid._message = f"移除对话框出错：{exc}"
+            self.grid.update()
             return
 
         # **顺序**：先落盘，成功了再改内存里的列表。
@@ -552,6 +563,82 @@ class Launchpad(QWidget):
         self._on_search(self.search.text())
         print(f"[Delete] 已从启动器移除：{entry.name}")
 
+    def _rename_entry(self, entry) -> None:
+        """
+        右键图标 → 重命名。
+
+        **不碰磁盘上的 ``.lnk``**，``Entry.name`` 保持原值；自定义名进
+        ``renames.json``（uid -> 显示名）。这么设计的三个理由见
+        ``paths.renames_file`` 与 ``library.Library.rename``。
+
+        写盘的先后顺序沿用 :meth:`_delete_entry`：先落盘、成功了再改内存。
+        ``Library.rename`` 内部已经是这个纪律并且自带回滚，这里只需要处理
+        「返回 False」（uid 对不上 / 磁盘写不进去）这一种情况。
+        """
+        try:
+            from .renamedlg import RenameDialog
+        except ImportError as exc:
+            print(f"[Rename] 模块不可用: {exc}")
+            return
+
+        try:
+            dlg = RenameDialog(entry, self)
+        except Exception as exc:
+            print(f"[Rename] 对话框构造失败: {exc}")
+            self.grid._message = f"改名对话框打不开：{exc}"
+            self.grid.update()
+            return
+
+        # **对话框这一层整体都要兜住**，不能只兜构造。
+        #
+        # 原来 try 只包了 ``RenameDialog(entry, self)``，``exec_()`` 和
+        # ``RenameDialog.Accepted`` 的比较都在外面。那一层出任何问题
+        # （对话框内部异常、控件缺失、被测试替身换掉…）都会一路抛出
+        # 信号槽 —— 而这里是用户点菜单进来的路径，掀翻了就是整个启动器
+        # 跟着没。「重命名」只是个锦上添花的功能，它坏了不该赔上主程序。
+        try:
+            accepted = (dlg.exec_() == RenameDialog.Accepted)
+            new_name = dlg.value() if accepted else ""
+        except Exception as exc:
+            print(f"[Rename] 对话框交互失败: {exc}")
+            self.grid._message = f"改名对话框出错：{exc}"
+            self.grid.update()
+            return
+
+        if not accepted:
+            return
+        try:
+            ok = self.library.rename(entry.uid, new_name)
+        except Exception as exc:
+            print(f"[Rename] 改名失败: {exc}")
+            self.grid._message = f"改名失败：{exc}"
+            self.grid.update()
+            return
+
+        if not ok:
+            self.grid._message = "改名没保存成功（磁盘写入失败），名字未变"
+            self.grid.update()
+            # 库状态可能已被别处改动，刷新让界面说实话
+            self._on_search(self.search.text())
+            return
+
+        # 名字变了，**必须重建 Tile** —— Tile 在构造时把名字烤进了
+        # _name 与 elide 结果。
+        #
+        # 光调 ``_on_search`` **不够**：``set_search`` 的「结果没变就不重建」
+        # 是给热键唤出那条最高频路径省开销的，比较用的是**对象身份**；
+        # 而改名是就地改 ``Entry.display``，对象还是同一个 —— 于是判定
+        # 「没变」，压根不重建，界面上还是旧名字。必须先显式失效。
+        # （这条是实测发现的：提示条说「已改名为 X」，界面上的字纹丝不动。）
+        self.grid.invalidate_tiles()
+        self._on_search(self.search.text())
+        if new_name:
+            self.grid._message = f"已改名为「{new_name}」（原名仍可搜到）"
+        else:
+            self.grid._message = f"已还原为原名「{entry.name}」"
+        self.grid.update()
+        print(f"[Rename] {entry.name} -> {new_name or '(还原)'}")
+
     def _show_about(self) -> None:
         """关于对话框。"""
         n = len(self.library.entries)
@@ -561,7 +648,7 @@ class Launchpad(QWidget):
             f"启动器当前收录 <b>{n}</b> 个应用。<br>"
             f"<br>"
             f"左键点击图标启动；滚轮或方向键翻页；"
-            f"右键图标可将其从启动器移除（不会删除源文件）；"
+            f"右键图标可重命名或将其从启动器移除（不会修改源文件）；"
             f"右键空白处打开菜单。")
 
     def _open_settings(self) -> None:

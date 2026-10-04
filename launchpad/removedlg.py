@@ -111,7 +111,16 @@ class DeleteDialog(QDialog):
         cancel.setObjectName("cancel")
         cancel.clicked.connect(self.reject)
         # 取消是默认按钮：危险操作里，最容易按到的那个绝不能是执行删除的。
-        self.setDefaultWidget(cancel)
+        #
+        # **用 ``QPushButton.setDefault(True)``，不是 ``QDialog.setDefaultWidget``。**
+        # 后者根本不存在 —— 那是 ``QMessageBox`` 的 API。这里原来写的是
+        # ``self.setDefaultWidget(cancel)``，于是对话框**一构造就抛
+        # AttributeError**，「从启动器移除」一点就崩。
+        #
+        # 为什么一直没被发现：``tests_remove`` 把 ``RD.DeleteDialog`` 换成了
+        # 假对话框来驱动 ``_delete_entry``，真对话框的 ``__init__`` 从未被
+        # 执行过。**测试替身越顺手，被替身盖住的那段就越容易腐烂。**
+        cancel.setDefault(True)
         cancel.setAutoDefault(True)
 
         remove = QPushButton("移除")

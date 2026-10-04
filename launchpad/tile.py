@@ -42,7 +42,16 @@ class Tile(QWidget):
         self._label_rect_cache = QRect()
 
         # 显示用的名字。失效快捷方式加 ⚠ —— 一次算好，绘制路径不再拼字符串。
-        self._name = entry.name + ("  ⚠" if entry.missing else "")
+        # 用 entry.label 而不是 entry.name：用户自定义的名字必须显示出来。
+        # label 是「自定义名优先、否则原名」的唯一真相来源。
+        # 用 label 而不是 entry.name：用户自定义的名字必须显示出来。
+        # label 是「自定义名优先、否则原名」的唯一真相来源。
+        #
+        # getattr 兜一层 label：这里接受鸭子类型（tests_blank / bench 会传
+        # 只有 name 的假条目），而构造期不是热路径，多这一次 getattr 无所谓。
+        # 真 library.Entry 一定有 label。
+        _label = getattr(entry, "label", None) or entry.name
+        self._name = _label + ("  ⚠" if entry.missing else "")
         # elide() 的结果，blankarea 等外部代码会读
         self._cached_elided = self._name
 
