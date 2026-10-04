@@ -202,21 +202,39 @@ def startup_link() -> Path:
     return _startup_link()
 
 
-def _plan() -> tuple[tuple[Path, bool], ...]:
+def _plan() -> tuple[tuple[str, Path, bool], ...]:
     """
-    四份快捷方式的唯一真相：(路径, 是否带 --show)。
+    快捷方式的唯一真相：``(用途, 路径, 是否带 --show)``。
 
     ``shortcut_targets()`` 与 ``repair_all()`` 都从这里取，
     避免两处各写一份列表而悄悄错位。
 
+    **为什么带一个「用途」字段**：原来的实现返回裸元组，``repair_all``
+    用 ``plan[:3]`` / ``plan[3]`` 这种**下标切片**来区分「用户点的入口」
+    和「开机自启」。加一份、删一份、换个顺序，这个下标就静默指错到
+    别的文件上 —— 而且不报错，只是悄悄修/删错了东西。名字比下标难错。
+
+    ## 桌面那份为什么不在这里
+
+    用户明确要求「桌面上不要留东西」。所以桌面**不生成**快捷方式，
+    启动器只从开始菜单和托盘进。
+
+    顺带说明那个「坏桩」是什么：桌面上原来有一个 ``Launchpad.lnk``，
+    但它的 ``TargetPath`` 是记事本、``IconLocation`` 指向一个**不存在**
+    一个根本不存在的 ``.ico`` 路径、``WorkingDirectory`` 为空 —— 三个字段全不对，
+    根本不是能用的启动器快捷方式（更像是早期某个探针脚本留下的）。
+    本模块曾经把它当自己的入口重写过，那是错的：对着一个不属于本程序
+    的文件做「修复」，修得越对越说明认错了对象。现在它已被删除
+    （备份留在 temp），且不再被自动重建。
+
     为什么带不带 ``--show`` 不一样：
 
-    * **带**（桌面、开始菜单 \\Launchpad\\）：用户主动点的入口，点完就该
+    * **带**（开始菜单 \\Launchpad\\ 那份）：用户主动点的入口，点完就该
       看到面板。``__main__.main()`` 见到 ``--show`` 才会 ``show_me()``。
     * **不带**（开始菜单根目录那份、Startup 那份）：启动器本来就该常驻、
-      靠热键唤出，SelfStart 在登录时弹一整屏界面既抢焦点又挡住用户
-      登录后的第一件事。开始菜单根目录那份历史上就没有 ``--show``，
-      本次保持原样 —— 修图标的顺带把启动语义改了，是把两件事混在
+      靠热键/手势唤出，SelfStart 在登录时弹一整屏界面既抢焦点又挡住
+      用户登录后的第一件事。开始菜单根目录那份历史上就没有 ``--show``，
+      本模块保持原样 —— 修图标的顺带把启动语义改了，是把两件事混在
       一次不可回退的写入里。
 
     另外，开始菜单的 ``Programs\\Launchpad.lnk`` 与
@@ -226,23 +244,55 @@ def _plan() -> tuple[tuple[Path, bool], ...]:
     """
     programs = _programs_dir()
     return (
-        (_desktop_dir() / _LNK_NAME, True),
-        (programs / _LNK_NAME, False),
-        (programs / _APP_DIR / _LNK_NAME, True),
-        (_startup_link(), False),
+        ("programs", programs / _LNK_NAME, False),
+        ("programs-subdir", programs / _APP_DIR / _LNK_NAME, True),
+        ("startup", _startup_link(), False),
     )
 
 
 def shortcut_targets() -> list[Path]:
     """
-    四份快捷方式的路径，**不管存不存在都返回**（桌面、开始菜单两份、
-    Startup 那份）。
+    快捷方式的路径，**不管存不存在都返回**（开始菜单两份 + Startup 那份）。
+    **桌面不在其中** —— 见 :func:`_plan` 里「桌面那份为什么不在这里」。
 
     不按存在性过滤：调用方（设置界面、修复流程）需要的是「应该在哪里」，
     而不是「现在在哪里」。过滤掉不存在的会让「少了一个」和「本来就该
     有」两种情况长得一模一样。
     """
-    return [path for path, _show in _plan()]
+    return [path for _role, path, _show in _plan()]
+
+
+def desktop_link() -> Path:
+    """
+    桌面上那份 ``Launchpad.lnk`` 的路径。
+
+    单独提供是为了让「清理桌面残留」这件事有明确的落点，而不是靠
+    ``shortcut_targets()`` 顺带扫到（它已经不扫桌面了）。
+    """
+    return _desktop_dir() / _LNK_NAME
+
+
+def remove_desktop_link() -> bool:
+    """
+    删掉桌面上那份 ``Launchpad.lnk``（如果还在）。返回是否真的删了。
+
+    只按这一个精确路径删，绝不 glob 桌面：桌面上还有用户自己的东西。
+    文件本来就不在时返回 False —— 幂等，不是失败。
+
+    为什么需要它：本模块曾经往桌面写过一个快捷方式，而那个位置原本
+    已经有一个坏桩（target 是记事本、图标指向不存在的文件）。修坏了它，
+    又把它改成了一个能用的启动器 —— 但用户要的是「桌面上什么都别留」，
+    所以正确处理是删掉而不是修好。
+    """
+    path = desktop_link()
+    try:
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+    except OSError:
+        # 被占用 / 权限不足 —— 留到下次再清，不抛。
+        return False
 
 
 # ── 写快捷方式 ──────────────────────────────────────────
@@ -358,26 +408,32 @@ def repair_all(shortcut: bool = True, startup_link: bool = False) -> dict:
     """
     重写快捷方式，返回 ``{'ok': n, 'fail': [...], 'skipped_icon': [...]}``。
 
-    * ``shortcut=True``    → 桌面 + 开始菜单那 3 份
+    * ``shortcut=True``    → 开始菜单那两份
     * ``startup_link=True``→ **另外**再重写 Startup 那份（默认不动：
       它是自启入口，改它会改变开机行为，而大多数只想修图标；
       而它迟早要被 :func:`cleanup_duplicate_autostart` 删掉，
       为它特意修一次图标没有意义）
 
+    **桌面不在修复范围内**（用户要求「桌面上不要留东西」，
+    见 :func:`_plan`）。要顺手清掉桌面残留用
+    :func:`remove_desktop_link`。
+
     ``skipped_icon`` 记的是「链接本身写成功了，但图标没设」的路径。
     它和 ``ok`` 不冲突：``ok`` 说快捷方式可用，``skipped_icon`` 说它的
     图标还停留在 target（Python）的图标上，调用方应该提示用户去跑
-    ``make_icon.py`` 生成 ``assets/launchpad.ico``。
+    ``make_icon.py` 生成 ``assets/launchpad.ico``。
 
     幂等，且不抛异常。
     """
     result = {"ok": 0, "fail": [], "skipped_icon": []}
-    plan = _plan()
 
-    # 前 3 份是「用户点的入口」，第 4 份是开机自启。
-    todo = list(plan[:3]) if shortcut else []
+    # 按**用途名**筛，不按下标切。原来是 plan[:3] / plan[3]，加一条删一条
+    # 就会静默指错文件，而且不报错。
+    todo = [(path, show) for role, path, show in _plan()
+            if role in ("programs", "programs-subdir")] if shortcut else []
     if startup_link:
-        todo.append(plan[3])
+        todo += [(path, show) for role, path, show in _plan()
+                 if role == "startup"]
 
     # 用同一个 _icon_location() 判断，跟 write_shortcut 实际写进去的
     # 依据保持一致 —— 两边各判一次的话，图标恰好在循环中途消失时

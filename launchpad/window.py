@@ -417,58 +417,35 @@ class Launchpad(QWidget):
 
         # 启动后要不要收起，由设置决定（默认不收起）。
         #
-        # 用户原话：「点开一个应用后不要自动退出，我有可能还要开启别的
-        # 应用」。macOS Launchpad 是点一下就走，但那种用法下要开第二个
-        # 应用必须重新按热键 —— 连续开三五个应用就是按三五次 F9。
+        # 用户原话：「点击完一个应用后，不要把窗口消失，我自己点击空白处
+        # 再消失」。所以窗口**原地不动**：不隐藏、不降权、不移到后面，
+        # 就停在这个状态，用户接着点下一个图标，或者点空白处自己收起。
         #
-        # 不收起时**不能**什么都不做：已经启动的应用窗口会被这个全屏
-        # 挡在后面，用户看着像「没启动」。所以做两件事：
-        #   1. 提示条告诉用户「已启动，按 Alt+Tab 过去 / 点空白收起」
-        #   2. 把窗口**降到被启动应用之下**（而不是隐藏）—— 这样 Alt+Tab
-        #      或点任务栏都能直接切到它，而用户想继续点别的应用时
-        #      再按一下热键就又回到最前面。
+        # 这里**不做**任何窗口状态的改动是刻意的。之前试过「把窗口压到
+        # 新启动的应用之下」（临时清掉 WindowStaysOnTopHint 再恢复），
+        # 理由是「全屏窗口杵在那儿会挡住刚启动的应用，用户看着像没启动」。
+        # 但那等于替用户做了一次他没要求的切换 —— 窗口位置跳一下、
+        # 前台应用悄悄换成刚启动的那个，都是用户没要求的副作用。
+        # 用户要的是「别动」，所以就什么都不动，只留一条提示告诉他
+        # 怎么收起、以及新应用在后面。
         #
-        # 为什么不直接 hide_me()：那样用户会以为应用没起来。
+        # 想要 macOS 那种「点一下就走」的行为：设置 → 行为 →
+        # 打开「启动后收起启动器」。
         if not self.settings.get("hide_after_launch"):
             self._announce_launch(entry.name)
         else:
             self.hide_me()
 
     def _announce_launch(self, name: str) -> None:
-        """启动后给一条提示，并把窗口压到新起的应用之下。
+        """启动后给一条提示。**不动窗口的任何状态。**
 
-        `_lower_below` 而不是 `hide_me()`：隐藏会把全屏表面也撤掉，
-        用户接下来只能按热键唤回来才能继续点别的图标 —— 那就等于
-        「还是要重新打开」，没解决他提的问题。压低则两个目标同时满足：
-        新窗口在前面可见，启动器还活着、随时能点下一个。
+        提示要说清两件事：新应用在启动器后面（用户知道去哪找它），
+        以及怎么收起（用户说了他自己点空白处收起）。
         """
-        try:
-            self._lower_below()
-        except Exception as exc:
-            print(f"[Launch] 压低窗口失败: {exc}")
-        self.grid._message = (f"已启动「{name}」 — "
-                              f"点下面的空白或按 Esc 收起启动器；"
-                              f"想开别的应用直接点图标")
+        self.grid._message = (f"已启动「{name}」，在启动器后面 — "
+                              f"想开别的直接点图标，"
+                              f"点空白处或按 Esc 收起")
         self.grid.update()
-
-    def _lower_below(self) -> None:
-        """
-        取消置顶，让新启动的应用窗口能浮到启动器上面。
-
-        置顶标志是在 __init__ 里一次性设的（FramelessWindowHint |
-        WindowStaysOnTopHint），这里临时清掉再恢复。用 raise_() 不够 ——
-        置顶窗口永远压在普通窗口之上，光 raise 是抬不过去的。
-        """
-        flags = self.windowFlags()
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
-        self.show()
-        self.raise_()
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        # 恢复置顶标志会触发一次 hide/show，所以最后再 raise 一次，
-        # 保证启动器自己仍然可点（否则用户点不到下一个图标）。
-        self.raise_()
-        self.activateWindow()
-        del flags
 
     def _mark_used(self, entry: Entry) -> None:
         """记录最近使用时间，供排序方式 recent 用。

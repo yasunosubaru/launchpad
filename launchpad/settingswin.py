@@ -619,10 +619,13 @@ class SettingsWindow(QDialog):
 
         row = QHBoxLayout()
         row.setSpacing(8)
-        self.repair_btn = QPushButton("修复桌面 / 开始菜单图标")
+        self.repair_btn = QPushButton("修复开始菜单图标")
         self.repair_btn.setToolTip(
-            "重写 .lnk 的 IconLocation，指向 assets\\launchpad.ico。\n"
-            "现在这些快捷方式用的是 Python 的图标，或者根本没设图标。")
+            "重写开始菜单两份 .lnk 的 IconLocation，指向\n"
+            "assets\\launchpad.ico。\n"
+            "现在它们用的是 Python 的图标，或者根本没设图标。\n"
+            "桌面那份不再生成（用户要求桌面上不留东西），\n"
+            "所以这个按钮不碰桌面。")
         self.repair_btn.clicked.connect(self._on_repair)
         row.addWidget(self.repair_btn)
 
@@ -632,6 +635,13 @@ class SettingsWindow(QDialog):
             "自启已统一走注册表，两者同时存在会在登录时拉起两次。")
         self.dup_btn.clicked.connect(self._on_cleanup_dup)
         row.addWidget(self.dup_btn)
+
+        self.desk_btn = QPushButton("清理桌面残留")
+        self.desk_btn.setToolTip(
+            "删掉桌面上的 Launchpad.lnk（如果还在）。\n"
+            "启动器只从开始菜单和托盘进，桌面上不留东西。")
+        self.desk_btn.clicked.connect(self._on_cleanup_desktop)
+        row.addWidget(self.desk_btn)
         row.addStretch(1)
         gl.addLayout(row)
 
@@ -716,6 +726,26 @@ class SettingsWindow(QDialog):
             "已删除 Startup 文件夹里的重复项" if removed
             else "Startup 文件夹里本来就没有重复项")
         self._refresh_autostart_ui()
+
+    def _on_cleanup_desktop(self) -> None:
+        """删掉桌面上的 Launchpad.lnk。
+
+        桌面上原来那个是**坏桩**（target 是记事本、图标指向不存在的
+        一个根本不存在的 .ico 路径、CWD 为空），根本不是能用的启动器入口。
+        用户要求「桌面上不要留东西」，所以正确处理是删掉而不是修好。
+        这个按钮留着是为了清掉升级过程中可能又被写回去的残留 ——
+        ``shortcuts.py`` 已经完全不再往桌面写，但别人手工复制的、
+        或者旧版本留下的，仍然需要一条清理路径。
+        """
+        from . import shortcuts as SC
+        try:
+            removed = SC.remove_desktop_link()
+        except Exception as exc:
+            self.repair_status.setText(f"清理失败：{exc}")
+            return
+        self.repair_status.setText(
+            "已删除桌面上的 Launchpad.lnk（启动器只从开始菜单和托盘进）"
+            if removed else "桌面上本来就没有 Launchpad.lnk")
 
     # ── 取值 ──────────────────────────────────────────────
     def load_values(self) -> None:

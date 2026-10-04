@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import QApplication                              # noqa: E4
 from launchpad import paths                                           # noqa: E402
 from launchpad.icons import warm_in_background                        # noqa: E402
 from launchpad.library import Library, db_file                        # noqa: E402
+from launchpad.log import install as install_log                      # noqa: E402
 from launchpad.paths import DEFAULT_SOURCE                            # noqa: E402
 from launchpad.settings import Settings                               # noqa: E402
 from launchpad.tray import Tray                                       # noqa: E402
@@ -62,6 +63,16 @@ def notify_existing_instance() -> bool:
 
 
 def main() -> int:
+    # 日志必须在**任何** print 之前装好，否则前面崩了就什么都没记下。
+    #
+    # 真实使用方式是从快捷方式/注册表拉起的 pythonw.exe —— 没有控制台，
+    # 所有 print 的输出都被丢弃。用户报「唤不出窗口」时，唯一能说明
+    # 「四组热键到底注册成功没有」的那行信息就在 stdout 里，而它必定
+    # 看不见。装上日志之后那些信息落到
+    # ``%APPDATA%\Launchpad\launchpad.log``。
+    _log_path = install_log()
+    print(f"[Main] 启动，日志 -> {_log_path}")
+
     mutex, already = acquire_single_instance()
     if already:
         notify_existing_instance()
@@ -116,6 +127,8 @@ def main() -> int:
     from launchpad.hotkeys import Hotkeys
     win._hotkeys = Hotkeys(lambda: win.show_me())
     win._hotkeys.start()
+    _hint = win._hotkeys.summary()
+    print(f"[Main] {_hint}")
 
     # 托盘图标。
     #
@@ -129,17 +142,41 @@ def main() -> int:
     # 托盘图标会跟着 QSystemTrayIcon 被回收掉（tray.py 的 docstring 有说明）。
     win._tray = Tray(win)
     if win._tray.available():
+        # 把「按哪个键唤出」写进 tooltip。pythonw 没有控制台，
+        # [Hotkey] 可用: ... 那行用户看不到 —— 不摆到看得见的地方，
+        # 「怎么唤出窗口」就只能靠猜。
+        win._tray.set_hint(_hint)
         win._tray.show()
     else:
         # 托盘不可用不是致命错误，只是少了常驻入口；热键照样能用。
         # 打印一句是为了让「开机后托盘里什么都没有」这件事可诊断。
         print(f"[Tray] 托盘图标不可用：{win._tray.reason()}"
-              f"（仍可用热键唤出启动器）")
+              f"（仍可用热键唤出：{_hint}）")
+
+    # 触控板手势唤出：系统级低层鼠标钩子。
+    #
+    # 为什么需要它：热键是「知道按哪几个键」才用得了的。有些用户
+    # 不知道、记不住、或者习惯只用触控板。而且托盘图标默认是折叠/
+    # 隐藏的，鼠标点不到时热键就是唯一入口。
+    #
+    # 钩子装不上（策略限制、其它程序占用）不是致命错误，打印一句就继续。
+    try:
+        from launchpad.wheelhook import WheelHook
+        hook = WheelHook(on_wake=lambda: win.show_me(),
+                         is_showing=lambda: win.is_showing())
+        if hook.start():
+            win._wheelhook = hook
+            print(f"[WheelHook] 触控板手势唤出已启用（{hook.stats()}）")
+        else:
+            print(f"[WheelHook] 未启用：热键/托盘仍可用")
+    except Exception as exc:
+        print(f"[WheelHook] 模块不可用（不影响其它唤出方式）: {exc}")
 
     if "--show" in sys.argv:
         win.show_me()
 
-    # 自启（无 --show）时只留托盘图标，不弹全屏界面。热键唤出是主要用法。
+    # 自启（无 --show）时只留托盘图标，不弹全屏界面。
+    # 三种唤出方式并存：热键、托盘单击、触控板手势。
     return app.exec_()
 
 

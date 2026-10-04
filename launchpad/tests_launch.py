@@ -56,7 +56,7 @@ def pump(ms=500):
     淡入淡出是 QVariantAnimation 驱动的，只转一帧的话量到的是动画的
     第一帧：明明 `hide_me()` 已经把 `_fade` 设成 0，opacity 却还是 1.0，
     于是「窗口有没有收起」这条断言会给出完全相反的结论。
-    这个坑踩过一次：���试以为「不收起」的实现有 bug，实际是测试没等动画。
+    这个坑踩过一次：测试以为「不收起」的实现有 bug，实际是测试没等动画。
     """
     end = time.perf_counter() + ms / 1000.0
     while time.perf_counter() < end:
@@ -140,6 +140,9 @@ A.launch_entry = fake_launch
 w = build(False, "keep")
 _launched.clear()
 w.grid._message = ""
+# 记下启动前的窗口 flags。断言「一个位都没动过」而不是「最后还是置顶」
+# ——后者对「改了再改回来」的实现也会通过，那正是要防的假通过。
+_flags_before = int(w.windowFlags())
 w._launch(lib.entries[0])
 pump(200)
 
@@ -152,11 +155,30 @@ check("给了「已启动」的提示", "已启动" in w.grid._message,
       w.grid._message[:44])
 check("提示里说明了怎么收起",
       "Esc" in w.grid._message or "空白" in w.grid._message)
-check("置顶标志已恢复（还能点下一个图标）",
+check("提示里说明新应用在启动器后面（否则用户不知道去哪找）",
+      "后面" in w.grid._message, w.grid._message[:44])
+# 新契约：**窗口状态全程不动**。
+#
+# 之前的实现是「把窗口压到刚启动的应用之下」—— 临时清掉
+# WindowStaysOnTopHint 再恢复。用户明确要求「不要把窗口消失，我自己
+# 点击空白处再消失」，也就是别替他做切换。所以现在断言的是 flags
+# 一个位都没动过，而不只是「最后还是置顶」（后者对「改了再改回来」
+# 的实现也会通过，正是要防的那种假通过）。
+check("置顶标志从头到尾没被动过（没改再改回来）",
+      bool(w.windowFlags() & Qt.WindowStaysOnTopHint)
+      and int(w.windowFlags()) == _flags_before,
+      f"before=0x{_flags_before:x} after=0x{int(w.windowFlags()):x}")
+check("仍然置顶（窗口停在原地，不被新应用压下去）",
       bool(w.windowFlags() & Qt.WindowStaysOnTopHint))
+check("没有把 Launchpad 降权成普通窗口",
+      bool(w.windowFlags() & Qt.FramelessWindowHint))
 check("连点第二个应用也能启动（不锁死后续点击）",
       (w._launch(lib.entries[1]) or pump(120) or _launched) == ["记事本", "计算器"],
       str(_launched))
+# 连点两次之后状态仍然没被动过。
+check("连点两个应用之后置顶标志仍然没被动过",
+      int(w.windowFlags()) == _flags_before,
+      f"before=0x{_flags_before:x} after=0x{int(w.windowFlags()):x}")
 
 head("[3] 启动后收起（hide_after_launch=True，macOS 行为）")
 w2 = build(True, "hide")

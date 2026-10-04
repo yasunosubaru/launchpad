@@ -98,6 +98,7 @@ class Tray:
         """
         self._window = window
         self._reason = ""      # available() 为 False 时的原因，调试用
+        self._hint = ""        # tooltip 第二行（见 set_hint）
 
         # 两个对象的 parent 要求**不一样**，不能图省事共用一个：
         #   QSystemTrayIcon(parent: QObject)  —— 任何 QObject 都行；
@@ -334,7 +335,24 @@ class Tray:
 
     def _tooltip_text(self) -> str:
         state = "已显示" if self._is_showing() else "已收起"
-        return f"{paths.APP_TITLE} — {state}（左键切换，右键菜单）"
+        tip = f"{paths.APP_TITLE} — {state}（左键切换，右键菜单）"
+        # 把「按哪个键唤出」塞进 tooltip：这个程序没有控制台，
+        # 启动时打印的 [Hotkey] 可用: ... 用户永远看不到。tooltip 是
+        # 常驻状态下唯一一定能被看见的地方。
+        if self._hint:
+            tip += f"\n{self._hint}"
+        return tip
+
+    def set_hint(self, text: str) -> None:
+        """
+        设置 tooltip 里的第二行（通常是「唤出：Ctrl+Alt+K / F9 …」）。
+
+        由调用方在热键注册**之后**调 —— 那时才知道哪几组真的成功了。
+        注册成功的集合会变（被输入法占用与否因机器而异），所以不能
+        在构造时写死。
+        """
+        self._hint = (text or "").strip()
+        self._refresh_tooltip()
 
     def _refresh_tooltip(self) -> None:
         """图标不可用时连 tooltip 都不去设，避免在 null icon 上做无用功。"""

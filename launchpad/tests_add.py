@@ -35,8 +35,22 @@ from launchpad.addapp import (AddPolicy, AddResult, Entry, Library,  # noqa: E40
                               scan_paths, scan_uwp_apps_from_start_menu,
                               shorten_path, uwp_icon_path)
 from launchpad.addapp import launch_entry, launch_shell_uri           # noqa: E402
+from launchpad import testfix                                        # noqa: E402
 
-SOURCE = Path(os.environ.get("LAUNCHPAD_SOURCE", Path.home() / "Desktop"))
+#: 扫描用的源目录。**默认是自建夹具**，不是用户桌面。
+#:
+#: 原来这里是 ``Path.home()/"Desktop"``。那个默认值让整套测试依赖用户的
+#: 桌面内容 —— 删掉桌面上一个 .lnk 就会让「扫描出候选条目」直接失败，
+#: 而那条失败与被测代码毫无关系。夹具见 testfix.py（指向真实存在的
+#: 系统 exe + 一个 UWP AUMID 条目，覆盖各条分支）。
+#:
+#: 仍然想对着真实目录跑：设 ``LAUNCHPAD_SOURCE`` 环境变量。
+_real = testfix.real_source()
+if _real is not None:
+    SOURCE = _real
+else:
+    SOURCE = testfix.default_source("lp_add")
+    print(f"[fixture] 用自建源目录：{SOURCE}")
 RUN_LAUNCH = "--no-launch" not in sys.argv
 
 #: 真机启动验证用的目标。计算器：无害、开得快、一定是 UWP（走

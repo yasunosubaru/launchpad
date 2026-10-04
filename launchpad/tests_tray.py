@@ -209,11 +209,18 @@ check("进程仍在运行（能继续 pump 说明没退出）", True)
 
 head("[7] 快捷方式路径与图标（只读，不写）")
 targets = SC.shortcut_targets()
-check("shortcut_targets() 返回 4 条", len(targets) == 4, str(len(targets)))
-check("桌面那份在里面",
-      any(Path(t).parent == Path.home() / "Desktop" for t in targets))
-check("三份开始菜单/桌面的都在",
-      sum(1 for t in targets if Path(t).is_file()) >= 3,
+check("shortcut_targets() 返回 3 条（不含桌面）", len(targets) == 3,
+      str(len(targets)))
+# 桌面**必须**不在里面。用户要求「桌面上不要留东西」，而 _plan 里曾经
+# 有桌面那一条 —— 一旦谁把它加回来，这里立刻红。
+check("shortcut_targets() 不含桌面",
+      not any(Path(t).parent == Path.home() / "Desktop" for t in targets),
+      str(targets))
+check("repair_all() 也不碰桌面",
+      not any("Desktop" in (p.parent.name or "") for p in targets),
+      "见下方 [8] 的读回核对")
+check("开始菜单两份都在",
+      sum(1 for t in targets if Path(t).is_file()) >= 2,
       f"{sum(1 for t in targets if Path(t).is_file())} 个存在")
 check("python_exe() 指向 pythonw（不闪黑框）",
       SC.python_exe().lower().endswith("pythonw.exe")
@@ -224,29 +231,47 @@ icon = SC.app_icon()
 check("app_icon() 指向真实存在的 .ico", bool(icon) and Path(icon).is_file(), icon)
 check("_icon_location() 带 ,0 后缀", SC._icon_location().endswith(",0"))
 
-head("[8] 桌面快捷方式的 IconLocation 已经指向 launchpad.ico")
+head("[8] 桌面上不留任何东西")
+# 坏桩已经被删掉：target 是记事本、图标指向一个根本不存在的 .ico、
+# CWD 为空，三项全不对，根本不是能用的启动器入口。正确处理是删掉。
+desk = SC.desktop_link()
+check("桌面链接不存在（坏桩已清）", not desk.exists(), str(desk))
+check("remove_desktop_link() 幂等（已不在时返回 False）",
+      SC.remove_desktop_link() is False)
+# 桌面上不能有**本程序**留下的东西。注意只按本程序会产生的文件名查，
+# 不用「整个桌面除了 desktop.ini 之外必须为空」那种写法 ——
+# 用户自己的文件、别人的快捷方式都会让那种断言在真实桌面上必然 FAIL，
+# 而那与被测代码毫无关系。
+_desk_dir = Path.home() / "Desktop"
+_ours = [p.name for p in _desk_dir.glob("Launchpad*")] if _desk_dir.is_dir() \
+    else []
+check("桌面上没有本程序留下的任何文件", not _ours, str(_ours))
+# .tmp.lnk 是 write_shortcut 的原子替换中间产物，正常不该留在桌面上
+_tmp = [p.name for p in _desk_dir.glob("*.tmp.lnk")] if _desk_dir.is_dir() \
+    else []
+check("桌面上没有残留的 .tmp.lnk（原子替换的中间产物）",
+      not _tmp, str(_tmp))
+
+head("[8b] 开始菜单快捷方式的 IconLocation 指向 launchpad.ico")
 try:
     import win32com.client
 
-    desktop = next(t for t in targets if Path(t).parent == Path.home() / "Desktop")
-    if Path(desktop).exists():
+    programs = SC.shortcut_targets()[0]
+    if Path(programs).exists():
         shell = win32com.client.Dispatch("WScript.Shell")
-        lnk = shell.CreateShortcut(str(desktop))
-        print(f"      icon  = {lnk.IconLocation!r}")
-        print(f"      args  = {lnk.Arguments!r}")
-        print(f"      wd    = {lnk.WorkingDirectory!r}")
+        lnk = shell.CreateShortcut(str(programs))
+        print(f"      {programs.name}: icon = {lnk.IconLocation!r}")
+        print(f"      args = {lnk.Arguments!r}   wd = {lnk.WorkingDirectory!r}")
         check("IconLocation 指向 assets\\launchpad.ico",
               lnk.IconLocation.lower().startswith(icon.lower()),
               lnk.IconLocation)
-        check("带 --show（从桌面点就该看到面板）",
-              "--show" in (lnk.Arguments or ""), lnk.Arguments)
         check("WorkingDirectory 是绝对路径且存在",
               bool(lnk.WorkingDirectory) and Path(lnk.WorkingDirectory).is_dir(),
               lnk.WorkingDirectory)
         check("TargetPath 真实存在",
               Path(lnk.TargetPath).is_file(), lnk.TargetPath)
     else:
-        check("桌面 .lnk 存在（跳过读回核对）", False, str(desktop))
+        check("开始菜单 .lnk 存在（跳过读回核对）", False, str(programs))
 except Exception as exc:
     check("读回 .lnk 时不抛异常", False, str(exc))
 
@@ -271,6 +296,7 @@ check("构造不抛异常（含读注册表）", sw is not None)
 check("有自启勾选框", hasattr(sw, "autostart_cb"))
 check("有修复按钮", hasattr(sw, "repair_btn"))
 check("有清理重复自启按钮", hasattr(sw, "dup_btn"))
+check("有清理桌面残留按钮", hasattr(sw, "desk_btn"))
 check("勾选框状态与注册表一致",
       sw.autostart_cb.isChecked() == bool(status["enabled"]),
       f"cb={sw.autostart_cb.isChecked()} reg={status['enabled']}")
@@ -293,6 +319,7 @@ check("状态行提到了「重复」这个状态",
 head("[11] 幂等：连续两次打开设置界面不改任何东西")
 _run_before = SC._run_value()
 _startup_before = SC.startup_link().exists()
+_desktop_before = SC.desktop_link().exists()
 for _ in range(2):
     w2 = SettingsWindow(st, parent=None, on_apply=None)
     w2.close()
@@ -302,6 +329,8 @@ check("注册表 Run 值没被打开设置界面改动",
       SC._run_value() == _run_before, repr(SC._run_value()))
 check("Startup .lnk 没被打开设置界面写回来",
       SC.startup_link().exists() == _startup_before)
+check("桌面 .lnk 没被打开设置界面写回来",
+      SC.desktop_link().exists() == _desktop_before)
 
 head("[12] 收尾")
 win.close()

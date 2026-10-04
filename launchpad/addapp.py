@@ -367,16 +367,57 @@ def launch_entry(entry: Entry) -> tuple[bool, str]:
             return False, str(exc)
 
     try:
+        # 下面四处 Popen **每一处**都必须显式带 CREATE_NO_WINDOW，漏一处
+        # 就漏一类黑框。
+        #
+        # 机制（不是"美化"，是 Win32 的分配规则）：CreateProcess 时如果
+        # 调用方自己**没有控制台**，而新进程是**控制台子系统**（PE 头里
+        # Subsystem = CONSOLE），Windows 就会给它**新分配一个控制台** ——
+        # 那是一个真实存在、可见的控制台窗口，等进程退出就消失。Launchpad
+        # 由 pythonw.exe 启动（GUI 子系统，自己就没有控制台），所以
+        # cmd.exe、python.exe、控制台型 .exe 全部命中这条规则，用户看到的
+        # 就是"点一下闪一个黑框"。只有显式给 CREATE_NO_WINDOW（或
+        # DETACHED_PROCESS）才能让 Windows 跳过这次分配；什么都不传就是
+        # 默认行为，闪框是必然而不是偶发。
+        #
+        # 注意方向：这条只针对**控制台子系统**的目标。真正的 GUI 程序
+        # （pythonw.exe、绝大多数 GUI .exe）默认就不分配控制台，本来不闪。
+        # 但"目标恰好是 GUI 程序"不能作为省略标志的理由 —— 那取决于用户
+        # 往库里拖了什么，四条分支各自都会被走到。
         if target.lower().endswith((".bat", ".cmd")):
+            # .bat / .cmd 必须经 cmd.exe 才能执行，而 cmd.exe 一定是控制台
+            # 子系统 —— 这一条是黑框的**主要**来源，标志位在这里最要紧。
             subprocess.Popen(["cmd", "/c", target],
-                             cwd=entry.workdir or None)
+                             cwd=entry.workdir or None,
+                             creationflags=CREATE_NO_WINDOW)
         elif target.lower().endswith(".py"):
+            # sys.executable 在本项目里可能是 python.exe（控制台）也可能是
+            # pythonw.exe（GUI）。是 python.exe 时它就是控制台子系统目标，
+            # CREATE_NO_WINDOW 从"可选优化"变成**必需**，否则每个 .py 条目
+            # 都会闪一帧黑框。
+            #
+            # 这里**刻意不动它、继续用 sys.executable**，而不是换成同目录
+            # 的 pythonw.exe：pythonw.exe 编译进 GUI 子系统，从根上就不分配
+            # 控制台，确实更彻底，但代价是脚本的 stdout/stderr 被彻底丢弃
+            # —— 脚本崩了用户只看到"点了没反应"，没有 traceback；
+            # ``python -u x.py``、输出重定向、attach 调试器这些手段也全部
+            # 失效。当前要解决的是"闪一下"，不是"静默跑脚本"，所以保留
+            # 可调试性、只压掉窗口。想要真正静默启动的用户，应该在条目的
+            # 参数里显式写 pythonw.exe，由他自己决定，而不是在这里替他决定。
             subprocess.Popen([sys.executable, target],
-                             cwd=entry.workdir or None)
+                             cwd=entry.workdir or None,
+                             creationflags=CREATE_NO_WINDOW)
         elif entry.args:
-            subprocess.Popen([target, entry.args], cwd=entry.workdir or None)
+            # 带参数的通用分支（.exe / .com / .bat 都可能落到这里）。
+            subprocess.Popen([target, entry.args],
+                             cwd=entry.workdir or None,
+                             creationflags=CREATE_NO_WINDOW)
         else:
-            subprocess.Popen([target], cwd=entry.workdir or None)
+            # 无参数的通用分支。理由同上一条：目标是控制台型 .exe 时，
+            # 不给标志就会分配一个可见控制台。
+            subprocess.Popen([target],
+                             cwd=entry.workdir or None,
+                             creationflags=CREATE_NO_WINDOW)
         return True, ""
     except Exception as exc:
         return False, str(exc)

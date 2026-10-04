@@ -6,7 +6,7 @@
 
     python -u -m launchpad.tests_icons
 
-它对真实目录 `%USERPROFILE%\Desktop` 里的每一个
+它对夹具目录（默认自建，见 testfix.py）里的每一个
 .lnk 跑完整提取流程，报告：总数 / 真实图标数 / 占位图数及逐条原因 /
 首次提取耗时 / 二次运行（命中磁盘缓存）耗时，以及每一种 icon_size 下的
 表现（48 / 96 / 128 / 256）。
@@ -37,11 +37,23 @@ from PyQt5.QtGui import QImage                                    # noqa: E402
 # 这几个是 icons.py 的内部函数，不是 API。但判据本身就是「字符串形状」
 # 和「像素统计」，要测它就必须直接调它 —— 包一层封装再测封装，
 # 等于测的是封装而不是判据（而判据正是出 bug 的地方）。
+from launchpad import testfix                                        # noqa: E402
 from launchpad.icons import (                                     # noqa: E402
     _LOW_COLOR_MAX_BUCKETS, _color_buckets, _is_installer_product_icon,
     _is_low_color)
 
-SOURCE = Path(os.environ.get("LAUNCHPAD_SOURCE", Path.home() / "Desktop"))
+#: 源目录。**默认自建夹具**，不是用户桌面。
+#:
+#: 原来是 ``Path.home()/"Desktop"``。那个默认值让整套图标测试挂在用户的
+#: 桌面内容上 —— 这次删掉桌面上那个 ``Launchpad.lnk`` 之后，本文件直接
+#: ``AssertionError: 没有任何条目，源目录可能变了``。测试夹具的一处变动
+#: 让测试变红，说明它测的是环境不是代码。
+#:
+#: 想对着真实目录跑（看自己桌面上那些应用的实际图标）：
+#:     python -u -m launchpad.tests_icons --real-source
+#: 或设 ``LAUNCHPAD_SOURCE``。
+_real_src = testfix.real_source()
+SOURCE = _real_src if _real_src is not None else None
 
 # 设置里允许的尺寸区间（settings.py: icon_size 默认 128，范围 48~256）
 SIZES = (48, 96, 128, 256)
@@ -164,13 +176,29 @@ def run_pass(size: int, entries: list, cache_dir: Path, label: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--source", default=str(SOURCE))
+    ap.add_argument("--source", default=None,
+                    help="扫描哪个目录（默认用自建夹具）")
+    ap.add_argument("--real-source", action="store_true",
+                    help="改用真实的源目录（LAUNCHPAD_SOURCE 或桌面）；"
+                         "那里没有 .lnk 时会明确报错而不是扫出 0 条")
     ap.add_argument("--real-cache", action="store_true",
                     help="用真实 LOCALAPPDATA（会删掉真实图标缓存里的 png）")
     ap.add_argument("--sizes", default=",".join(str(s) for s in SIZES))
     args = ap.parse_args()
 
-    folder = Path(args.source)
+    folder = Path(args.source) if args.source else None
+    if args.real_source:
+        folder = _real_src
+        if folder is None:
+            # 明确报错，而不是让下游 assert 打出「源目录可能变了」——
+            # 那句话会把人引到错误的方向（去查 scan_folder）。
+            print("没有可用的真实源目录：LAUNCHPAD_SOURCE 未设，"
+                  f"且 {Path.home() / 'Desktop'} 里没有 .lnk。")
+            return 2
+        print(f"用真实源目录：{folder}")
+    elif folder is None:
+        folder = testfix.default_source("lp_icons")
+        print(f"[fixture] 用自建源目录：{folder}")
     sizes = [int(s) for s in args.sizes.split(",") if s.strip()]
 
     if not folder.is_dir():

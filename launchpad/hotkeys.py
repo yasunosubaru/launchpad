@@ -233,6 +233,28 @@ class Hotkeys:
     def running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
 
+    def summary(self) -> str:
+        """
+        一句人类可读的「按哪个键唤出」。
+
+        存在的理由：这个程序正常是 pythonw.exe 启动的，**没有控制台**，
+        ``[Hotkey] 可用: ...`` 那行 print 在真实使用方式下必定被丢弃。
+        于是「我到底该按哪个键」在界面上无处可查 —— 用户只能一个个试，
+        或者干脆改用别的方式（比如触控板手势）唤出。这句要摆到
+        **看得见的地方**：托盘 tooltip 和设置窗口。
+
+        注意 ``ok`` 是**实际注册成功**的，不是 ``BINDINGS`` 里声明的。
+        两者可能不同（被输入法等程序占用时），照实说。
+        """
+        if self.ok:
+            keys = " / ".join(self.ok)
+        else:
+            keys = "（都没注册成功）"
+        s = f"唤出：{keys}"
+        if self.failed:
+            s += f"　（{', '.join(self.failed)} 被占用）"
+        return s
+
     def _run(self) -> None:
         u, k = _apis()
         hinst = k.GetModuleHandleW(None)
