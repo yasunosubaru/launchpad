@@ -700,6 +700,26 @@ class Grid(QWidget):
 
         触控板的精细滚动走 pixelDelta（angleDelta 为 0），那边才用像素累积，
         阈值取页高的 1/4，和离散滚动手感区分得开。
+
+        ## 触控板具体是什么手感
+
+        触控板上报的是 **pixelDelta**（一串小像素位移），不是滚轮那种
+        「一格 = 120」的离散刻度，所以走的是另一套判定：累加像素，
+        每攒够**页高的 1/4** 翻一页。
+
+        2560x1600、页高 1422 时一步 = 355px 累积量。触控板一次「轻推」
+        大约 30~80px，所以要推 4~12 下才翻一页 —— 这就是两指滑动翻页
+        该有的密度：能停在任意位置，不会一碰就跳页。指尖甩得快
+        （单次 >355px）则直接翻一页，不会因为单次位移大就连翻好几页，
+        因为翻页数取自 accum 的**总量**而不是单次值。
+
+        `_wheel_accum` 每 250ms（`WHEEL_RESET_MS`）收不到新事件就清零：
+        停手之后算新的一次，不把上次的余量带过来。
+
+        注意：多指捏合缩放、四指横滑（切桌面/切窗口）是**驱动/系统**
+        层面的手势，走 Win32 的 WM_POINTER / WM_GESTURE，**不会**变成
+        QWheelEvent，本程序收不到，也就无法响应。本机 `SM_MAXTOUCHES=0`
+        （触控设备被绑定在 Mouse 类上），连单指 Touch 事件都没有。
         """
         angle = ev.angleDelta().y()
         pixel = ev.pixelDelta().y()
@@ -711,7 +731,7 @@ class Grid(QWidget):
         if angle:
             # 离散滚轮：手势节流，一次手势只翻一页。
             now = time.monotonic() * 1000.0
-            if now - self._wheel_last_ms > self.WHEEL_GESTURE_MS:
+            if now - self._wheel_last_ms > self._wheel_gesture_ms():
                 self._wheel_gesture = 0        # 静默够久 -> 新手势
             self._wheel_last_ms = now
             d = 1 if angle > 0 else -1
@@ -745,6 +765,20 @@ class Grid(QWidget):
             self._wheel_timer.timeout.connect(
                 lambda: setattr(self, "_wheel_accum", 0))
         self._wheel_timer.start(self.WHEEL_RESET_MS)
+
+    def _wheel_gesture_ms(self) -> int:
+        """
+        手势节流窗口，读设置（缺省回落到类常量）。
+
+        **必须是方法而不是常量。** 常量只在类定义时算一次，运行期改
+        设置不生效；而且用户没法调手感 —— 「划快一点才翻第二页」和
+        「连划容易一次滑两页」是两种人，两种都要能选。
+        """
+        try:
+            v = int(self.settings.get("wheel_gesture_ms"))
+        except (KeyError, TypeError, ValueError):
+            return self.WHEEL_GESTURE_MS
+        return max(80, min(600, v))
 
     def keyPressEvent(self, ev: QKeyEvent):
         k = ev.key()

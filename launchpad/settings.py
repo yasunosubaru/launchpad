@@ -49,6 +49,12 @@ SCHEMA: dict[str, tuple] = {
     # 行为
     "hide_labels":        (False, bool, None, None),
     "click_through_empty":(True, bool, None, None),  # 左键空白退出
+    # 点图标启动后是否收起启动器。
+    # False（默认）= 启动后**留在原地**，可以接着点别的应用 —— 用户要的是这个：
+    # 「点开一个应用后不要自动退出，我有可能还要开启别的应用」。
+    # True = macOS Launchpad 的行为，点一下就走，下一个应用等下次热键再唤。
+    # 做成设置而不是写死，是因为两种都有人要；而写死的话改主意就得改代码。
+    "hide_after_launch":  (False, bool, None, None),
     "paging_animation":   (True, bool, None, None),
     "paging_style":       ("smooth", str, None, None),
     "page_duration":      (320, int, 80, 900),
@@ -57,6 +63,9 @@ SCHEMA: dict[str, tuple] = {
     "open_anim":          (True, bool, None, None),
     "open_duration":      (220, int, 60, 800),
     "reduce_motion":      (False, bool, None, None),
+    # 滚轮手势节流窗口（ms）。一次手势 = 一次翻页。
+    # 调大 = 划快一点才翻第二页；调小 = 连划容易一次滑两页。
+    "wheel_gesture_ms":   (220, int, 80, 600),
     # 搜索
     "pinyin_search":      (True, bool, None, None),
 }

@@ -23,6 +23,7 @@ from launchpad.icons import warm_in_background                        # noqa: E4
 from launchpad.library import Library, db_file                        # noqa: E402
 from launchpad.paths import DEFAULT_SOURCE                            # noqa: E402
 from launchpad.settings import Settings                               # noqa: E402
+from launchpad.tray import Tray                                       # noqa: E402
 from launchpad.window import Launchpad                                # noqa: E402
 
 APP_TITLE = "Launchpad"
@@ -116,9 +117,29 @@ def main() -> int:
     win._hotkeys = Hotkeys(lambda: win.show_me())
     win._hotkeys.start()
 
+    # 托盘图标。
+    #
+    # 为什么必须有：窗口的「收起」是降不透明度 + 鼠标穿透，**从不调 hide()**
+    # （重建全屏表面要 OS 重新合成整屏，每次按热键都来一次 40~50ms 卡顿，
+    # 见 window.py show_me 里的对比数据）。所以收起之后程序没有任何可见
+    # 的东西，用户既不知道它还活着、也没法把它叫回来 —— 只能杀进程。
+    # 托盘是常驻状态唯一的可见出口。
+    #
+    # 句柄挂在 win 上而不是局部变量：局部变量在 main() 返回后就被 GC，
+    # 托盘图标会跟着 QSystemTrayIcon 被回收掉（tray.py 的 docstring 有说明）。
+    win._tray = Tray(win)
+    if win._tray.available():
+        win._tray.show()
+    else:
+        # 托盘不可用不是致命错误，只是少了常驻入口；热键照样能用。
+        # 打印一句是为了让「开机后托盘里什么都没有」这件事可诊断。
+        print(f"[Tray] 托盘图标不可用：{win._tray.reason()}"
+              f"（仍可用热键唤出启动器）")
+
     if "--show" in sys.argv:
         win.show_me()
 
+    # 自启（无 --show）时只留托盘图标，不弹全屏界面。热键唤出是主要用法。
     return app.exec_()
 
 

@@ -67,6 +67,16 @@ class Launchpad(QWidget):
         self._fade = 1.0
         # True = 全屏表面已创建，之后不再重建（见 show_me 的性能对比）
         self._resident = False
+        # 「用户此刻看不看得见启动器」的权威标志。
+        #
+        # 为什么不能靠 windowOpacity() 判断：Qt 里 QWidget 的初始不透明度
+        # 就是 1.0，而开机自启（无 --show）走完 main() 之后窗口**从没被
+        # show_me() 过** —— 屏幕上什么都没有，不透明度却是 1.0。
+        # 托盘图标要判断「单击该显示还是该隐藏」，拿不透明度当判据的话，
+        # 自启后的**第一次**单击会去调 hide_me()，看起来就是「托盘点了没反应」。
+        # 同理 isVisible() 也不行：窗口一旦 showMe 过就永远 True
+        # （这里刻意不调 hide()，见 show_me 里重建全屏表面的性能对比）。
+        self._user_visible = False
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
 
@@ -192,6 +202,20 @@ class Launchpad(QWidget):
         self._activate()
         self._resize()
         self._after_show()
+        # 整条显示路径跑完才置位：托盘图标靠它判断「单击该显示还是该隐藏」，
+        # 中途抛异常就还该留在收起态。
+        self._user_visible = True
+
+    def is_showing(self) -> bool:
+        """
+        用户此刻看不看得见启动器。
+
+        给托盘图标（tray.py）当显示/隐藏的判据。这是**唯一**正确的问法 ——
+        见 ``__init__`` 里 ``_user_visible`` 那段注释：opacity 和
+        isVisible() 在「自启后从未 show_me」和「常驻收起」两种状态下
+        都会给出与实际不符的答案。
+        """
+        return self._user_visible
 
     def _after_show(self) -> None:
         """窗口可见之后要做的事（两条显示路径共用）。"""
@@ -243,6 +267,11 @@ class Launchpad(QWidget):
         if self._closing:
             return
         self._closing = True
+        # 立刻置位，不等淡出动画跑完：淡出途中点托盘图标应当是「重新显示」，
+        # 这时窗口确实还没完全消失，而 show_me() 会停掉正在跑的动画并复位
+        # _closing（这里不做的话，淡出 finished 会在重新显示之后又把窗口藏掉，
+        # 症状是「点一下托盘闪一下又没了」）。
+        self._user_visible = False
         if self._anim:
             self._anim.stop()
         self._start_fade(self._fade, 0.0)
@@ -385,7 +414,61 @@ class Launchpad(QWidget):
             self.grid.update()
             return
         self._mark_used(entry)
-        self.hide_me()
+
+        # 启动后要不要收起，由设置决定（默认不收起）。
+        #
+        # 用户原话：「点开一个应用后不要自动退出，我有可能还要开启别的
+        # 应用」。macOS Launchpad 是点一下就走，但那种用法下要开第二个
+        # 应用必须重新按热键 —— 连续开三五个应用就是按三五次 F9。
+        #
+        # 不收起时**不能**什么都不做：已经启动的应用窗口会被这个全屏
+        # 挡在后面，用户看着像「没启动」。所以做两件事：
+        #   1. 提示条告诉用户「已启动，按 Alt+Tab 过去 / 点空白收起」
+        #   2. 把窗口**降到被启动应用之下**（而不是隐藏）—— 这样 Alt+Tab
+        #      或点任务栏都能直接切到它，而用户想继续点别的应用时
+        #      再按一下热键就又回到最前面。
+        #
+        # 为什么不直接 hide_me()：那样用户会以为应用没起来。
+        if not self.settings.get("hide_after_launch"):
+            self._announce_launch(entry.name)
+        else:
+            self.hide_me()
+
+    def _announce_launch(self, name: str) -> None:
+        """启动后给一条提示，并把窗口压到新起的应用之下。
+
+        `_lower_below` 而不是 `hide_me()`：隐藏会把全屏表面也撤掉，
+        用户接下来只能按热键唤回来才能继续点别的图标 —— 那就等于
+        「还是要重新打开」，没解决他提的问题。压低则两个目标同时满足：
+        新窗口在前面可见，启动器还活着、随时能点下一个。
+        """
+        try:
+            self._lower_below()
+        except Exception as exc:
+            print(f"[Launch] 压低窗口失败: {exc}")
+        self.grid._message = (f"已启动「{name}」 — "
+                              f"点下面的空白或按 Esc 收起启动器；"
+                              f"想开别的应用直接点图标")
+        self.grid.update()
+
+    def _lower_below(self) -> None:
+        """
+        取消置顶，让新启动的应用窗口能浮到启动器上面。
+
+        置顶标志是在 __init__ 里一次性设的（FramelessWindowHint |
+        WindowStaysOnTopHint），这里临时清掉再恢复。用 raise_() 不够 ——
+        置顶窗口永远压在普通窗口之上，光 raise 是抬不过去的。
+        """
+        flags = self.windowFlags()
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+        self.show()
+        self.raise_()
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        # 恢复置顶标志会触发一次 hide/show，所以最后再 raise 一次，
+        # 保证启动器自己仍然可点（否则用户点不到下一个图标）。
+        self.raise_()
+        self.activateWindow()
+        del flags
 
     def _mark_used(self, entry: Entry) -> None:
         """记录最近使用时间，供排序方式 recent 用。

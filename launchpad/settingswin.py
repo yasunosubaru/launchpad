@@ -98,7 +98,13 @@ GROUP_SPECS: tuple = (
         ("hide_labels", "隐藏图标文字", "bool", None,
          "同时会关掉文字的空白区命中判定"),
         ("click_through_empty", "左键点空白退出", "bool", None,
-         "关掉后左键点空白无反应；右键点空白始终打开设置"),
+         "关掉后左键点空白无反应；右键点空白始终打开菜单"),
+        ("hide_after_launch", "启动后收起启动器", "bool", None,
+         "关掉（默认）= 点图标启动后启动器留在原地，可以接着点下一个；"
+         "打开 = macOS 的行为，点一下就走"),
+        ("wheel_gesture_ms", "滚轮手势节流", "int", 10, "毫秒。"
+         "一次滑动只翻一页；调小 = 连划容易一次滑两页，"
+         "调大 = 要划快一点才翻第二页"),
     )),
 )
 
@@ -525,6 +531,8 @@ class SettingsWindow(QDialog):
                 self.rows[key] = row
                 gl.addWidget(row)
             form.addWidget(gb)
+
+        form.addWidget(self._build_system_group())
         form.addStretch(1)
 
         area = QScrollArea()
@@ -559,6 +567,156 @@ class SettingsWindow(QDialog):
         self._sync_motion_enabled()
         self._center_on(parent)
 
+    # ── 系统集成（自启 + 快捷方式修复） ──────────────────────
+    def _build_system_group(self) -> QGroupBox:
+        """
+        「系统集成」组：开机自启开关 + 快捷方式图标修复。
+
+        ## 为什么这两项不在 GROUP_SPECS 里
+
+        GROUP_SPECS 的每一项都会被 :meth:`collect` 收进 ``values()``，
+        进而写进 ``settings.json``。而这两项的真相**不在 settings.json 里**：
+        自启状态存在注册表 ``HKCU\\...\\Run``，图标存在 ``.lnk`` 的
+        IconLocation 字段里。把它们做成普通设置项会出现两个真问题：
+
+        1. **状态会分叉。** 用户在「任务管理器 → 启动」里禁用了本程序，
+           settings.json 里的 ``autostart=true`` 不会跟着变；下次打开设置
+           界面显示的还是「已开启」，而实际开机不启动 —— 开关看起来坏了。
+        2. **「保存」会偷偷改系统。** 其它设置项点保存只写一个文件，
+           这两项点保存会去动注册表和磁盘上的快捷方式，失败也只能事后
+           才知道，无法参与取消/回滚。
+
+        所以这里做成**立即执行的动作**：勾上就写注册表，按钮就重写 .lnk，
+        各自在下面那行状态文字里如实回报结果，不进快照、不进取消。
+
+        这一组还刻意**不在设置界面打开时做任何写入**：构造过程中只读
+        注册表来填勾选框，写入一律等用户真的去点。这很重要 ——
+        设置界面是常被打开的窗口，每次打开都改一次系统状态会掩盖
+        「用户到底改没改」这件事。
+
+        顺带一个真实存在过的坑：自启曾经同时存在「注册表 Run 键」和
+        「Startup 文件夹里的 .lnk」两处，开机时被拉起两次。所以状态行
+        会在两处都在时明确说「有重复」，并给出清理按钮 —— 只显示
+        「已开启」会把这个重复状态盖过去。
+        """
+        gb = QGroupBox("系统集成")
+
+        gl = QVBoxLayout(gb)
+        gl.setContentsMargins(6, 6, 6, 6)
+        gl.setSpacing(8)
+
+        self.autostart_cb = QCheckBox("开机自动启动（登录后静默进托盘）")
+        self.autostart_cb.setToolTip(
+            "写入 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run。"
+            "不会在登录时弹全屏界面，只留托盘图标，用热键唤出。")
+        self.autostart_cb.stateChanged.connect(self._on_autostart_toggled)
+        gl.addWidget(self.autostart_cb)
+
+        self.autostart_status = QLabel()
+        self.autostart_status.setObjectName("hint")
+        self.autostart_status.setWordWrap(True)
+        gl.addWidget(self.autostart_status)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.repair_btn = QPushButton("修复桌面 / 开始菜单图标")
+        self.repair_btn.setToolTip(
+            "重写 .lnk 的 IconLocation，指向 assets\\launchpad.ico。\n"
+            "现在这些快捷方式用的是 Python 的图标，或者根本没设图标。")
+        self.repair_btn.clicked.connect(self._on_repair)
+        row.addWidget(self.repair_btn)
+
+        self.dup_btn = QPushButton("清理重复自启")
+        self.dup_btn.setToolTip(
+            "删掉 Startup 文件夹里的那份 Launchpad.lnk。\n"
+            "自启已统一走注册表，两者同时存在会在登录时拉起两次。")
+        self.dup_btn.clicked.connect(self._on_cleanup_dup)
+        row.addWidget(self.dup_btn)
+        row.addStretch(1)
+        gl.addLayout(row)
+
+        self.repair_status = QLabel()
+        self.repair_status.setObjectName("hint")
+        self.repair_status.setWordWrap(True)
+        gl.addWidget(self.repair_status)
+
+        self._refresh_autostart_ui()
+        return gb
+
+    def _refresh_autostart_ui(self) -> None:
+        """按注册表的真实状态刷新勾选框和状态行（不触发写入）。"""
+        from . import shortcuts as SC
+        try:
+            st = SC.autostart_status()
+        except Exception as exc:
+            self.autostart_cb.setChecked(False)
+            self.autostart_status.setText(f"读不到自启状态：{exc}")
+            return
+
+        # 加载界面时阻断信号，避免「刷新显示」被当成「用户改了开关」
+        # 而去写一遍注册表。
+        self._suspend = True
+        try:
+            self.autostart_cb.setChecked(bool(st["enabled"]))
+        finally:
+            self._suspend = False
+
+        if st["startup_link_exists"]:
+            self.autostart_status.setText(
+                "已开启 —— 但 Startup 文件夹里还有一份重复的，"
+                "登录时会被拉起两次。点「清理重复自启」删掉它。")
+        elif st["enabled"]:
+            self.autostart_status.setText("已开启（注册表 Run 键，登录后静默进托盘）")
+        else:
+            self.autostart_status.setText("未开启")
+
+    def _on_autostart_toggled(self, _state: int) -> None:
+        from . import shortcuts as SC
+        if self._suspend:
+            return
+        want = self.autostart_cb.isChecked()
+        try:
+            ok = SC.set_autostart(want)
+        except Exception as exc:
+            self.repair_status.setText(f"写自启失败：{exc}")
+            self._refresh_autostart_ui()      # 勾选框弹回真实状态
+            return
+        if not ok:
+            self.repair_status.setText(
+                "写注册表失败（HKCU Run 键没写进去），已恢复原状态。")
+            self._refresh_autostart_ui()
+            return
+        self._refresh_autostart_ui()
+
+    def _on_repair(self) -> None:
+        from . import shortcuts as SC
+        try:
+            rep = SC.repair_all(shortcut=True)
+        except Exception as exc:
+            self.repair_status.setText(f"修复失败：{exc}")
+            return
+
+        parts = [f"重写了 {rep['ok']} 个快捷方式"]
+        if rep["fail"]:
+            parts.append(f"{len(rep['fail'])} 个失败（{rep['fail'][0]}）")
+        if rep["skipped_icon"]:
+            parts.append(
+                f"{len(rep['skipped_icon'])} 个没设图标 —— "
+                f"assets\\launchpad.ico 不存在，先跑 python make_icon.py")
+        self.repair_status.setText("；".join(parts))
+
+    def _on_cleanup_dup(self) -> None:
+        from . import shortcuts as SC
+        try:
+            removed = SC.cleanup_duplicate_autostart()
+        except Exception as exc:
+            self.repair_status.setText(f"清理失败：{exc}")
+            return
+        self.repair_status.setText(
+            "已删除 Startup 文件夹里的重复项" if removed
+            else "Startup 文件夹里本来就没有重复项")
+        self._refresh_autostart_ui()
+
     # ── 取值 ──────────────────────────────────────────────
     def load_values(self) -> None:
         """把 Settings 里的值刷进界面（静默，不触发 on_apply）。"""
@@ -571,6 +729,10 @@ class SettingsWindow(QDialog):
         finally:
             self._suspend = False
         self._pending.clear()
+        # 自启勾选框也要跟着刷新：设置窗口可以一直开着，而用户在
+        # 「任务管理器 → 启动」里禁用本程序、或用别的工具改了注册表，
+        # 都不会经过本进程。切回这个窗口时必须显示真实状态。
+        self._refresh_autostart_ui()
 
     def values(self) -> dict:
         """界面上当前的完整取值（已钳制）。"""
