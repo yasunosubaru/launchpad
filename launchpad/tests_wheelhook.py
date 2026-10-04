@@ -315,6 +315,203 @@ c.advance(60)
 check("作废后同一手势继续滚也不会触发", f2.feed(120, 120) is False,
       f"accum={f2.accum}")
 
+# ─────────────────────────────────────────────────────────
+# [14] 这是「鼠标滚轮一划就弹出来」那个 bug 的回归测试。
+#
+# bug 在 _on_wheel 的调用点上，不在 _Flick 里，所以必须驱动
+# _on_wheel 本身才能测出来 —— 只测 _Flick 是测不到这个 bug 的
+# （这正是它当初漏过去的原因）。
+#
+# 原代码：
+#     started = flick.is_start(now_ms)     # 只有第 1 格 True
+#     if flick.feed(delta, now_ms):        # 第 2 格攒满 240 -> True
+#         if started and not edge_ok: ...   # 第 2 格 started=False -> 跳过
+#         trigger()                         # 直接弹
+#
+# 一格 120、阈值 240，所以**攒满阈值的那一格恰好 started=False**，
+# 边缘检查被整条跳过 -> edge_px 从来没生效。
+#
+# 修法：判定结果存在 self._gesture_ok，跟着整个手势走，第一格定一次。
+#
+# 复现方式是**假的** MSLLHOOKSTRUCT：不需要真钩子，也不需要真鼠标，
+# 直接把 x 和 delta 喂进 _on_wheel。
+# ─────────────────────────────────────────────────────────
+head("[14] 回归：屏幕中间快速滚两格不得唤出（这正是用户报的 bug）")
+
+
+class _FakeHS(ctypes.Structure):
+    """字段顺序与 MSLLHOOKSTRUCT 一致，这样 _wheel_delta(hs.mouseData)
+    和 hs.pt.x 都能按真实布局读到。"""
+    _fields_ = [("pt", WH._POINT),
+                ("mouseData", ctypes.c_ulong),
+                ("flags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+_real_monotonic = time.monotonic
+
+
+class _PatchClock:
+    """在 drive() 期间把 wheelhook 模块的 time.monotonic 冻住。"""
+    def __init__(self, holder):
+        self.holder = holder
+
+    def monotonic(self):
+        return self.holder["t"] / 1000.0
+
+    def time(self):
+        return _real_monotonic()
+
+    def __enter__(self):
+        WH.time.monotonic = self.monotonic
+        WH.time.time = self.time
+        return self
+
+    def __exit__(self, *exc):
+        WH.time.monotonic = _real_monotonic
+        WH.time.time = _real_monotonic
+        return False
+
+
+class _RecBridge:
+    """记录 woken.emit() 次数的假桥。
+
+    **不能**只数``on_wake`` 被调了几次：on_wake 是在 ``_Bridge._deliver``
+    里调的，而 _deliver 要靠 GUI 线程的事件循环投递。没起真钩子时
+    ``self._bridge is None``，于是 emit 那一行整条被跳过 —— 判定其实
+    成功了（``triggers`` 计数为 1），只是没人接。
+    """
+    def __init__(self):
+        self.woken = self
+        self.n = 0
+
+    def emit(self):
+        self.n += 1
+
+
+def drive2(hook, seq):
+    """按 (x, delta, 间隔ms) 序列驱动 _on_wheel，返回 (emit 次数, stats)。"""
+    fired = []
+    hook.on_wake = lambda: fired.append(1)
+    hook.is_showing = lambda: False
+    bridge = _RecBridge()
+    hook._bridge = bridge
+    holder = {"t": 1000.0}
+    # 真实钩子不能起（会跟真人输入打架），这里只测判定路径。
+    with _PatchClock(holder):
+        for x, delta, gap in seq:
+            holder["t"] += gap
+            hs = _FakeHS()
+            hs.pt.x = x
+            hs.pt.y = 5
+            hs.mouseData = (delta & 0xFFFF) << 16
+            hs.flags = 0
+            hook._on_wheel(0, ctypes.byref(hs))
+    return bridge.n, hook.stats()
+
+
+if scr_ok:
+    mid = sw // 2
+    edge = 4
+
+    # 主体：屏幕中间快速连滚两格 —— 旧版必弹，新版必须不弹
+    hk = WheelHook(on_wake=lambda: None, is_showing=lambda: False,
+                   edge_px=40)
+    fired, st = drive2(hk, [(mid, 120, 0), (mid, 120, 60)])
+    check("屏幕中间快速滚 2 格 -> **不唤出**（这就是那个 bug）",
+          fired == 0, f"触发了 {fired} 次")
+    check("off_edge 计数被记下（判定确实跑过了，不是没看见事件）",
+          st.get("off_edge", 0) >= 1, f"off_edge={st.get('off_edge')}")
+    check("triggers 为 0", st.get("triggers", 0) == 0,
+          f"triggers={st.get('triggers')}")
+
+    # 中间滚 20 格都不许弹（真实场景：在浏览器里一路滚到底）
+    hk = WheelHook(on_wake=lambda: None, is_showing=lambda: False,
+                   edge_px=40)
+    seq = [(mid, 120, 50) for _ in range(20)]
+    fired, st = drive2(hk, seq)
+    check("屏幕中间连滚 20 格 -> 一次都不唤出",
+          fired == 0, f"触发了 {fired} 次")
+
+    # 起点在边缘 -> 必须能唤出（别把功能修死了）
+    hk = WheelHook(on_wake=lambda: None, is_showing=lambda: False,
+                   edge_px=40)
+    fired, st = drive2(hk, [(edge, 120, 0), (edge, 120, 60)])
+    check("起点贴左边缘滚 2 格 -> 唤出（功能没被修死）",
+          fired == 1, f"触发了 {fired} 次")
+    check("triggers 计数为 1", st.get("triggers", 0) == 1,
+          f"triggers={st.get('triggers')}")
+
+    # 起点在边缘，中途移到中间 —— 仍然要唤出（这是「从侧边滑进来」的语义）
+    hk = WheelHook(on_wake=lambda: None, is_showing=lambda: False,
+                   edge_px=40)
+    fired, st = drive2(hk, [(edge, 120, 0), (mid, 120, 60)])
+    check("起点在边缘、中途滑到中间 -> 仍然唤出（前提跟整个手势）",
+          fired == 1, f"触发了 {fired} 次")
+
+    # 起点在中间、第 2 格才移到边缘 —— **不许**唤出
+    # 这一条是修复前会弹、修复后不弹的最直接对照
+    hk = WheelHook(on_wake=lambda: None, is_showing=lambda: False,
+                   edge_px=40)
+    fired, st = drive2(hk, [(mid, 120, 0), (edge, 120, 60)])
+    check("起点在中间、第 2 格才挨到边缘 -> **不唤出**"
+          "（旧版在这里就弹了，因为它攒满的那格跳过了边缘检查）",
+          fired == 0, f"触发了 {fired} 次")
+
+    # 负 delta（向上滚）同样受边缘约束
+    hk = WheelHook(on_wake=lambda: None, is_showing=lambda: False,
+                   edge_px=40)
+    fired, st = drive2(hk, [(mid, -120, 0), (mid, -120, 60)])
+    check("向上滚（负 delta）在中间也不唤出",
+          fired == 0, f"触发了 {fired} 次")
+
+    # edge_px = 0（用户显式选「不限」）时，中间滚也要能唤出
+    hk = WheelHook(on_wake=lambda: None, is_showing=lambda: False,
+                   edge_px=0)
+    fired, st = drive2(hk, [(mid, 120, 0), (mid, 120, 60)])
+    check("edge_px=0（显式选不限）-> 中间滚 2 格也唤出",
+          fired == 1, f"触发了 {fired} 次")
+
+    # 停手后重新从边缘起手 -> 能再次唤出（前提不粘住上一次手势）
+    hk = WheelHook(on_wake=lambda: None, is_showing=lambda: False,
+                   edge_px=40)
+    fired, st = drive2(hk, [
+        (edge, 120, 0), (edge, 120, 60),       # 第 1 次手势：触发
+        (edge, 120, 900), (edge, 120, 60),     # 停手 900ms 后：再触发
+    ])
+    check("停手超过窗口后重新从边缘起手 -> 能再次唤出（前提不粘住）",
+          fired == 2, f"触发了 {fired} 次")
+
+    # 中间滚完、长手势后半段移到边缘 —— 仍不许唤出
+    hk = WheelHook(on_wake=lambda: None, is_showing=lambda: False,
+                   edge_px=40)
+    fired, st = drive2(hk, [
+        (mid, 120, 0), (mid, 120, 60), (mid, 120, 60),  # 攒到 3 格
+        (edge, 120, 60), (edge, 120, 60),               # 移到边缘继续
+    ])
+    check("整个手势起点在中间、后半段移到边缘 -> 全程不唤出",
+          fired == 0, f"触发了 {fired} 次")
+
+    # 注入事件照旧忽略
+    hk = WheelHook(on_wake=lambda: None, is_showing=lambda: False,
+                   edge_px=40)
+    holder = {"t": 1000.0}
+    with _PatchClock(holder):
+        for i in range(4):
+            holder["t"] += 30
+            hs = _FakeHS()
+            hs.pt.x = edge
+            hs.pt.y = 5
+            hs.mouseData = 120 << 16
+            hs.flags = WH.LLMHF_INJECTED
+            hk._on_wheel(0, ctypes.byref(hs))
+    check("注入事件（LLMHF_INJECTED）照旧被忽略，不唤出",
+          hk.stats().get("triggers", 0) == 0,
+          f"triggers={hk.stats().get('triggers')}")
+else:
+    print("  [跳过] 拿不到屏幕宽度，边缘相关用例跑不了")
+
 n_pass = sum(1 for _, ok, _ in _results if ok)
 n_fail = len(_results) - n_pass
 print()

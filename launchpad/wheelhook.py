@@ -279,6 +279,14 @@ class _Flick:
     正确的判据是**时间**而不是累积量：「用户停手了」的直接可观测量就是
     「距上一个滚轮事件过去了多久」。手势窗口过期本身就是停手的证据，
     不需要第二个阈值。
+
+    ## 这个状态机只管「滑得快不快」
+
+    「起点在不在屏幕边缘」那道限制**不归它管** —— 见
+    :meth:`WheelHook._on_wheel` 里关于手势级前提的说明。把两件事混在
+    一起，会让「一个手势算不算数」取决于「哪个事件负责判」：那是本文件
+    第二版的真 bug，一格 120、阈值 240，于是**攒满阈值的那一格恰好
+    ``is_start`` 为 False**，边缘检查被整条跳过，``edge_px`` 从来没生效。
     """
 
     __slots__ = ("threshold", "window_ms", "accum", "latch", "_last_ms")
@@ -308,9 +316,9 @@ class _Flick:
     def discard(self) -> None:
         """把本次手势作废（累积清零、解除 latch），不触发。
 
-        用于「判定为手势但条件不满足」的场景（比如起点不在屏幕边缘）——
-        那种情况下不应该让累积继续攒着，否则一个手势的前半段在边缘内、
-        后半段移出去时仍会触发，那不是用户想要的「从侧边滑入」。
+        用于「判定为手势但条件不满足」的场景（比如调用点按别的附加条件
+        否决）——那种情况下不应该让累积继续攒着，否则一个手势的前半段
+        条件满足、后半段不满足时仍会触发。
         """
         self.accum = 0
         self.latch = False
@@ -407,6 +415,11 @@ class WheelHook:
         self.edge_px = max(0, int(edge_px))
 
         self._flick = _Flick(max(1, int(flick_delta)), max(1, int(flick_ms)))
+        #: 当前手势是否通过了「起点在边缘带内」这道前提。**跟着整个手势
+        #: 走**，不随中途的指针位置改变。详见 :meth:`_on_wheel` 里的说明
+        #: —— 这里曾经是个 bug：前提被判在了错误的那一格上（攒够阈值的那
+        #: 格恰好 started=False），于是 edge_px 从来没生效过。
+        self._gesture_ok = False
         self._hook_proc = None       # HOOKPROC 实例，必须保活（见下方注释）
         self._bridge = None
         self._thread = None
@@ -418,9 +431,13 @@ class WheelHook:
         self.error = ""
 
         # 统计。_count 在钩子线程和 GUI 线程两边都会写，所以统一走锁。
+        # off_edge = 「手势起点不在屏幕边缘带内」而被丢弃的次数 ——
+        # 这个计数器是这类 bug 的直接证据：用户抱怨「滚轮一划就弹」时，
+        # 它应该很大（说明钩子看到了事件但判定把它们放过去了）；修好之后
+        # 它会大于等于 triggers，因为正常滚动全落在这一支。
         self._stat = {"events": 0, "injected": 0, "triggers": 0,
                       "wakes": 0, "suppressed": 0, "last_delta": 0,
-                      "last_trigger_at": 0.0}
+                      "last_trigger_at": 0.0, "off_edge": 0}
 
     # ── 生命周期 ─────────────────────────────────────────
     def start(self) -> bool:
@@ -524,6 +541,8 @@ class WheelHook:
         s["hook_thread_id"] = tid or None
         s["accum"] = self._flick.accum
         s["latched"] = self._flick.latch
+        s["gesture_ok"] = self._gesture_ok
+        s["edge_px"] = self.edge_px
         s["ignore_injected"] = self.ignore_injected
         s["flick_delta"] = self._flick.threshold
         s["flick_ms"] = self._flick.window_ms
@@ -648,14 +667,47 @@ class WheelHook:
             return
         now_ms = int(time.monotonic() * 1000)
         flick = self._flick
-        started = flick.is_start(now_ms)
-        if flick.feed(delta, now_ms):
-            # 边缘判定只在**手势的第一个事件**上做：用户「从侧边滑进来」
-            # 的起点在那里，中途指针会跑到屏幕中间去。
-            if started and not self._edge_ok(hs.pt.x):
+
+        # ── 手势级前提：起点必须在屏幕侧边 ──
+        #
+        # 这里曾经是本文件最严重的 bug。原写法是::
+        #
+        #     started = flick.is_start(now_ms)      # 只有第 1 格为 True
+        #     if flick.feed(delta, now_ms):         # 累积够 240 才 True
+        #         if started and not self._edge_ok(x):   # ← 只在第 1 格上判
+        #             return
+        #         self._count_trigger(delta)        # ← 没判，直接弹
+        #
+        # 一格 = 120、阈值 = 240，所以第 1 格 started=True 但攒不够、
+        # 不触发；**第 2 格攒满了、触发，而它的 started 恰好是 False** ——
+        # 于是边缘检查被整条跳过。结论：``edge_px`` 从来没生效过，
+        # 屏幕任何地方快速滚两下都弹，实测症状正是用户报的
+        # 「鼠标滚轮一划就弹出来」。
+        #
+        # 修法：判定结果存在 ``self._gesture_ok`` 里，跟着整个手势走。
+        # 它在手势的第一格定一次，之后本手势内不再改判 —— 这正是
+        # 「从侧边滑进来」的语义（起点在边上，中途指针会滑到中间）。
+        # 停手超过窗口 = 新手势，下一格重新定。
+        if flick.is_start(now_ms):
+            self._gesture_ok = self._edge_ok(hs.pt.x)
+            if not self._gesture_ok:
                 self._count("off_edge")
-                flick.discard()
-                return
+
+        # **无论手势合不合格都要 feed。**
+        #
+        # feed 的第二个作用是推进 ``_last_ms``，也就是「手势窗口有没有过期」
+        # 的唯一依据。合格手势直接 return 掉不喂的话，``_last_ms`` 永远停在
+        # -1，于是 ``is_start`` 对每个事件都返回 True，前提被反复重判——
+        # 一个起点在屏幕中间的长滚动，指针漂到边上之后就会「转正」触发。
+        # 这正是 tests_wheelhook 里那条「整个手势起点在中间、后半段移到
+        # 边缘 -> 全程不唤出」抓到的问题。
+        fired = flick.feed(delta, now_ms)
+        if not self._gesture_ok:
+            # 不合格手势：把累积扔掉，让它攒不满，也就不会 latch。
+            flick.discard()
+            return
+
+        if fired:
             self._count_trigger(delta)
             bridge = self._bridge
             if bridge is not None:

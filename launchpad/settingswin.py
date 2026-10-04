@@ -105,6 +105,9 @@ GROUP_SPECS: tuple = (
         ("wheel_gesture_ms", "滚轮手势节流", "int", 10, "毫秒。"
          "一次滑动只翻一页；调小 = 连划容易一次滑两页，"
          "调大 = 要划快一点才翻第二页"),
+        ("wake_gesture", "触控板手势唤出", "bool", None,
+         "默认关闭。打开后会装一个系统级滚轮钩子，"
+         "也就是说这台机器上的每次滚动它都看得见"),
         ("wake_edge_px", "手势唤出·边缘范围", "int", 10, "像素。"
          "手势起点离屏幕左/右边缘多少像素内才算唤出。\n"
          "0 = 不限 —— 但那样在浏览器里快速滚动两下就会弹出来"),
@@ -121,6 +124,8 @@ LAYOUT_KEYS = frozenset({
 # 这些键由「减弱动效」总开关控制
 MOTION_KEYS = ("open_anim", "open_duration", "paging_animation",
                "paging_style", "page_duration", "page_easing", "hover_anim")
+# 这些键只在「触控板手势唤出」打开时才有意义（关着时钩子压根没装）
+WAKE_PARAM_KEYS = ("wake_edge_px", "wake_notches")
 
 
 def clamp(key: str, value):
@@ -570,6 +575,7 @@ class SettingsWindow(QDialog):
         self._snapshot = self.settings.as_dict()
         self.load_values()
         self._sync_motion_enabled()
+        self._sync_wake_enabled()
         self._center_on(parent)
 
     # ── 系统集成（自启 + 快捷方式修复） ──────────────────────
@@ -791,6 +797,7 @@ class SettingsWindow(QDialog):
         self._pending[key] = value
         self.settings.set(key, value)         # 内存即时生效（预览用）
         self._sync_motion_enabled()
+        self._sync_wake_enabled()
         self._flush()
 
     def _flush(self) -> None:
@@ -812,6 +819,20 @@ class SettingsWindow(QDialog):
             if row is not None:
                 row.set_row_enabled(not off)
 
+    def _sync_wake_enabled(self) -> None:
+        """
+        手势唤出关着时，把它的两个参数置灰。
+
+        这两个参数（边缘范围、需要几格）在手势关着的时候**完全不影响任何
+        行为** —— 钩子压根没装。不置灰的话，界面上两行可调的数字会让
+        用户以为改了有效果，其实改了什么都没有。
+        """
+        on = bool(self.settings.get("wake_gesture"))
+        for key in WAKE_PARAM_KEYS:
+            row = self.rows.get(key)
+            if row is not None:
+                row.set_row_enabled(on)
+
     # ── 动作 ──────────────────────────────────────────────
     def reset_defaults(self) -> None:
         """
@@ -829,6 +850,7 @@ class SettingsWindow(QDialog):
             self._pending[key] = defaults[key]
         self.settings.update(defaults)
         self._sync_motion_enabled()
+        self._sync_wake_enabled()
         self._flush()
         self.reset_btn.setText("已恢复默认")
         from PyQt5.QtCore import QTimer
@@ -855,6 +877,7 @@ class SettingsWindow(QDialog):
             self._suspend = False
         self.settings.update(self._snapshot)
         self._sync_motion_enabled()
+        self._sync_wake_enabled()
         if self.on_apply is not None:
             try:
                 self.on_apply(touched or dict(self._snapshot))

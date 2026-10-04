@@ -153,27 +153,35 @@ def main() -> int:
         print(f"[Tray] 托盘图标不可用：{win._tray.reason()}"
               f"（仍可用热键唤出：{_hint}）")
 
-    # 触控板手势唤出：系统级低层鼠标钩子。
+    # 触控板手势唤出：系统级低层鼠标钩子。**默认不启用**（设置
+    # wake_gesture = True 才开）。
     #
-    # 为什么需要它：热键是「知道按哪几个键」才用得了的。有些用户
-    # 不知道、记不住、或者习惯只用触控板。而且托盘图标默认是折叠/
-    # 隐藏的，鼠标点不到时热键就是唯一入口。
+    # 为什么默认关：这个钩子装上之后，这台机器上的**每一次滚轮**它都看得见。
+    # 用户实测报过「鼠标滚轮一划就弹出来」——那是个真 bug（edge_px 判定被
+    # 判在了攒够阈值的那一格上，于是那道限制从没生效过），已修。但即便修好，
+    # 让一个常驻全局钩子去抢普通滚轮这件事本身就很容易惹人烦。用户说不行，
+    # 那就不默认开着；真需要的人在设置里自己打开。
     #
-    # 钩子装不上（策略限制、其它程序占用）不是致命错误，打印一句就继续。
+    # 装不上（策略限制、其它程序占用）也不是致命错误，打印一句就继续。
     try:
-        from launchpad.wheelhook import WheelHook
-        hook = WheelHook(
-            on_wake=lambda: win.show_me(),
-            is_showing=lambda: win.is_showing(),
-            flick_delta=120 * settings.get("wake_notches"),
-            edge_px=settings.get("wake_edge_px"))
-        if hook.start():
-            win._wheelhook = hook
-            print(f"[WheelHook] 触控板手势唤出已启用："
-                  f"从屏幕左右边缘 {hook.edge_px}px 内滑入，"
-                  f"快速滑 {settings.get('wake_notches')} 格")
+        if settings.get("wake_gesture"):
+            from launchpad.wheelhook import WheelHook
+            hook = WheelHook(
+                on_wake=lambda: win.show_me(),
+                is_showing=lambda: win.is_showing(),
+                flick_delta=120 * settings.get("wake_notches"),
+                edge_px=settings.get("wake_edge_px"))
+            if hook.start():
+                win._wheelhook = hook
+                print(f"[WheelHook] 触控板手势唤出已启用："
+                      f"从屏幕左右边缘 {hook.edge_px}px 内滑入，"
+                      f"快速滑 {settings.get('wake_notches')} 格")
+            else:
+                print(f"[WheelHook] 未启用：热键/托盘仍可用")
         else:
-            print(f"[WheelHook] 未启用：热键/托盘仍可用")
+            print("[WheelHook] 触控板手势唤出：未开启"
+                  "（设置里的 wake_gesture 打开才生效；"
+                  "不开就不会装全局钩子，不碰你的滚轮）")
     except Exception as exc:
         print(f"[WheelHook] 模块不可用（不影响其它唤出方式）: {exc}")
 
