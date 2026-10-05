@@ -420,6 +420,14 @@ class WheelHook:
         #: —— 这里曾经是个 bug：前提被判在了错误的那一格上（攒够阈值的那
         #: 格恰好 started=False），于是 edge_px 从来没生效过。
         self._gesture_ok = False
+        #: 最近一次手势起点离屏幕边缘的距离（px），供诊断用。-1 = 未知。
+        #: 有它才能在用户说「没反应」时直接报出「差 340px，阈值 120px」，
+        #: 而不是又一次靠猜。
+        self._last_edge_dist = -1
+        #: 是否把「起点不在边缘带」也打日志。默认 False —— 因为正常滚动
+        #: 在屏幕中间进行时**每一次**都会被拒，不静音的话日志会被刷爆，
+        #: 真正有用的触发记录反而被埋掉。设True 只用于排查。
+        self._verbose = False
         self._hook_proc = None       # HOOKPROC 实例，必须保活（见下方注释）
         self._bridge = None
         self._thread = None
@@ -543,6 +551,8 @@ class WheelHook:
         s["latched"] = self._flick.latch
         s["gesture_ok"] = self._gesture_ok
         s["edge_px"] = self.edge_px
+        s["last_edge_dist"] = self._last_edge_dist
+        s["verbose"] = self._verbose
         s["ignore_injected"] = self.ignore_injected
         s["flick_delta"] = self._flick.threshold
         s["flick_ms"] = self._flick.window_ms
@@ -551,6 +561,45 @@ class WheelHook:
             s["last_trigger_age_s"] = round(
                 time.time() - s["last_trigger_at"], 3)
         return s
+
+    def diagnose(self) -> str:
+        """
+        一行人话，说明「手势为什么没反应」。
+
+        ## 为什么需要这个函数
+
+        这个功能之前**完全没有可观测性**：统计只在启动时打一次到日志，
+        用户试了手势之后到底收到了几个事件、是被边缘判定拒了、还是
+        累积没攒够，日志里一个字都没有。于是每次反馈都是「不行」，
+        而我只能靠猜 —— 先后猜错了两次（「钩子收不到触控板事件」、
+        「DPI 坐标换算错了」）。
+
+        有了它，「不行」就能立刻变成一个具体的数字：到底是
+        ``events=0``（钩子没收到输入）、``off_edge>0``（位置不在边缘带）、
+        还是 ``events>0 且 off_edge=0``（位置对了但没攒够格数）。
+        """
+        s = self.stats()
+        if not s.get("running"):
+            return (f"手势不可用：钩子没在运行（{s.get('error') or '原因未知'}）")
+        if s.get("events", 0) == 0:
+            return ("手势不可用：钩子在跑，但**一个滚轮事件都没收到**。"
+                    "说明这个钩子在这台机器上看不到输入（多见于驱动不"
+                    "上报合成滚轮的情况）。")
+        bits = [f"收到 {s['events']} 个滚轮事件"]
+        if s.get("off_edge", 0):
+            bits.append(f"其中 {s['off_edge']} 次手势起点不在边缘 "
+                        f"{s['edge_px']}px 内被拒")
+        else:
+            bits.append("起点都在边缘带内")
+        if s.get("triggers", 0):
+            bits.append(f"触发 {s['triggers']} 次")
+        else:
+            need = s.get("flick_delta", 240)
+            bits.append(f"**一次都没触发** —— 没能攒够 {need}"
+                        f"（{need // 120} 格）")
+        if s.get("suppressed", 0):
+            bits.append(f"因窗口已显示而抑制 {s['suppressed']} 次")
+        return "；".join(bits)
 
     def _count(self, key: str, n: int = 1) -> None:
         with self._lock:
@@ -689,9 +738,20 @@ class WheelHook:
         # 「从侧边滑进来」的语义（起点在边上，中途指针会滑到中间）。
         # 停手超过窗口 = 新手势，下一格重新定。
         if flick.is_start(now_ms):
-            self._gesture_ok = self._edge_ok(hs.pt.x)
+            # y 一起传：多屏上下排列时，同一个 x 可能落在两块屏上，
+            # 只看 x 会把「上面那块屏的中间」误判成贴边。
+            self._gesture_ok = self._edge_ok(hs.pt.x, hs.pt.y)
+            self._last_edge_dist = self._edge_distance(hs.pt.x, hs.pt.y)
             if not self._gesture_ok:
                 self._count("off_edge")
+                # 记下被拒时的实际距离。��户报「手势没反应」时，这一行
+                # 直接告出差多少：比如「起点离边缘 340px，阈值 120px」，
+                # 于是知道该调阈值还是该改动作。日志在此之前完全没有
+                # 这个信息，是「两次猜错」的直接原因。
+                if self._verbose:
+                    print(f"[WheelHook] 手势起点离边缘 "
+                          f"{self._last_edge_dist}px（阈值 "
+                          f"{self.edge_px}px），不触发")
 
         # **无论手势合不合格都要 feed。**
         #
@@ -709,13 +769,36 @@ class WheelHook:
 
         if fired:
             self._count_trigger(delta)
+            print(f"[WheelHook] 手势触发：起点离边缘 "
+                  f"{self._last_edge_dist}px，delta={delta}，"
+                  f"累积 {self._flick.accum}/{self._flick.threshold}")
             bridge = self._bridge
             if bridge is not None:
                 # 唯一的跨线程动作，QueuedConnection 把它排到 GUI 线程。
                 # 真正的 on_wake 在 _Bridge._deliver 里，不在这里。
                 bridge.woken.emit()
 
-    def _edge_ok(self, x: int) -> bool:
+    def _edge_distance(self, x: int, y: int = 0) -> int:
+        """
+        起点离所在显示器**左右边缘**的最近距离（像素）。
+
+        单独抽出来是为了诊断：只要能报出「差多少」，用户说没反应时
+        就不用再猜 —— 阈值不够就调阈值，动作不对就改动作。拿不到显示器
+        信息时返回 -1（表示未知，而不是假装是 0）。
+        """
+        u, _ = _api()
+        try:
+            hmon = u.MonitorFromPoint(_POINT(int(x), int(y)), 2)
+            mi = _MONITORINFO()
+            mi.cbSize = ctypes.sizeof(_MONITORINFO)
+            if not u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                return -1
+            r = mi.rcMonitor
+            return min(int(x) - r.left, r.right - int(x))
+        except Exception:
+            return -1
+
+    def _edge_ok(self, x: int, y: int = 0) -> bool:
         """
         手势起点是否落在屏幕侧边的「边缘带」里。
 
@@ -726,27 +809,46 @@ class WheelHook:
         全系统的，任何程序里的一次快滑都会被看到。
 
         限制成「从屏幕左侧/右侧边缘往里滑」之后就基本不会误触 ——
-        正常滚动时指针不会停在屏幕最边上，而从侧边滑入本来就是触控板
-        用户最熟悉的动作（macOS 的 hot corner / Launchpad 边缘唤出）。
+        而从侧边滑入本来就是触控板用户最熟悉的动作（macOS 的 hot corner）。
 
-        ``edge_px = 0`` 表示不限制（全屏任何位置都算），对应设置里的
-        「0 = 不限」。
+        ## 一次被实测推翻的错误结论（不要再走一遍）
 
-        多显示器：用 ``MonitorFromPoint`` 取指针**所在那块屏**的矩形，
-        而不是主屏 —— 指针在副屏上时，主屏的宽度会给出完全错误的判断。
+        我曾断定「钩子给的是物理坐标、``GetMonitorInfoW`` 给的是虚拟化
+        逻辑坐标，缩放 1.5，所以 ``right - x`` 会算出负数、边缘判定彻底失效」。
+        **那是错的。** 两条实测证据：
+
+        * ``GetCursorPos`` 与 ``GetPhysicalCursorPos`` 在五个已知坐标上
+          （含 ``(1706,1066)`` 主屏右下、``(-1707,0)`` 副屏最左）
+          返回**完全相同**的值 -> 本机缩放就是 1.0，不存在虚拟化。
+        * ``sizeof(MSLLHOOKSTRUCT) == 32``，与 MSDN 的 x86_64 布局一致；
+          写入 ``pt.x=1897`` 能原样读出 -> 不是结构体错位。
+
+        当时采到的 ``x`` 最大 1897（超出主屏 1707）是**真实光标位置**——
+        采样期间屏幕布局还在变动，后来才稳定。所以算术是对的，
+        **真正的问题是触发带只有 40px（屏宽的 2.3%），根本瞄不准。**
+
+        因此这里**不需要任何坐标换算**，只把band 放宽到 120px。
+
+        ## 多显示器
+
+        用 ``MonitorFromPoint`` 取指针**所在那块屏**的矩形，而不是主屏 ——
+        指针在副屏上时，主屏的宽度会给出完全错误的判断。
+
+        ``y`` 用来在多屏上下排列时区分同一 x 上的不同屏；默认 0 表示
+        「不关心纵向位置」（单屏、或左右排列时的常见情况）。
         """
         band = int(getattr(self, "edge_px", 0) or 0)
         if band <= 0:
             return True
-        u, _ = _api()
-        try:
-            hmon = u.MonitorFromPoint(
-                _POINT(int(x), 0), 2)          # 2 = MONITOR_DEFAULTTONEAREST
-            mi = _MONITORINFO()
-            mi.cbSize = ctypes.sizeof(_MONITORINFO)
-            if not u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
-                return True                    # 拿不到就放行，不拦用户
-            left, right = mi.rcMonitor.left, mi.rcMonitor.right
-        except Exception:
+        dist = self._edge_distance(x, y)
+        if dist < 0:
+            # 拿不到显示器信息就放行。宁可多弹一次，也不要让用户
+            # 明明做了手势却完全没反应 —— 后者会让人以为功能坏了。
             return True
-        return x - left <= band or right - x <= band
+        # dist 是「到最近那条竖边的距离」，已经取过 min，所以
+        # 「贴左边」和「贴右边」不用分别判。
+        #
+        # dist 为负 = 指针在显示器矩形之外。多屏布局变动时 rect 可能
+        # 瞬时不包含当前 x；此时判成贴边是合理的（指针确实在某块屏的
+        # 边上或已经越过去了），而且负值天然 <= band，符合直觉。
+        return dist <= band

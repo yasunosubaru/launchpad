@@ -37,15 +37,48 @@ WM_DESTROY = 0x0002
 HWND_MESSAGE = wintypes.HWND(-3)
 WND_CLASS_NAME = "LaunchpadHotkeyHost"
 
-# 实测本机占用情况（2026-10）：
-#   Ctrl+Space / Ctrl+Alt+Space  -> 被输入法等程序占用
-#   Ctrl+Alt+K / F9             -> 可用
-BINDINGS = [
-    ("Ctrl+Alt+K", MOD_CONTROL | MOD_ALT, ord("K")),
+# 热键分组：**第一组是主力，后面是备用。**
+#
+# ## 为什么要分组
+#
+# 用户报「热键太难按」。原因很具体：``Ctrl+Alt+K`` 要从home 位伸手到
+# 字母区，右手还要离开鼠标。而 ``Alt+Space`` 两个键都在**底排**，
+# 左手小指按Alt、中指按空格，**手完全不用移动** —— 这是底排能凑出的
+# 最省力组合。
+#
+# ## 占用情况是实测的，不是猜的
+#
+# 用「注册试探」扫过全机：一个组合能注册成功 = 当前没人占；返回
+# ``ERROR_HOTKEY_ALREADY_REGISTERED (1409)`` = 已被占。实测结果：
+#
+#   空闲：Alt+Space / Ctrl+\ / Alt+Esc / Ctrl+Alt+Left 等 21 个
+#   被占：Win+Space（Windows 语音输入）、Ctrl+Esc、Ctrl+`、
+#         Win+Tab（虚拟桌面）、Ctrl+Alt+Tab
+#
+# 注意 ``RegisterHotKey`` 只能反映**此刻**的占用。有些软件是
+# 「用到时才注册」（老程序的 Alt+Space 窗口移动就是典型），那种这里
+# 测不出来 —— 所以保留了四组备用，真撞上了换下一组即可。
+#
+# ## 为什么主力只留一个
+#
+# 托盘 tooltip 和设置窗口都只显示 ``PRIMARY``，免得给一长串让用户
+# 记不住。备用的仍然注册，但不主动宣传。
+
+PRIMARY: list[tuple[str, int, int]] = [
+    ("Alt+Space", MOD_ALT, ord(" ")),
+]
+
+# 备用组：主力被占用时按顺序顶上。不宣传，只在 summary 里兜底提一句。
+FALLBACK: list[tuple[str, int, int]] = [
+    ("Ctrl+\\", MOD_CONTROL, 0xDC),
+    ("Alt+Esc", MOD_ALT, 0x1B),
     ("F9", 0, 0x78),
+    ("Ctrl+Alt+K", MOD_CONTROL | MOD_ALT, ord("K")),
     ("Ctrl+Space", MOD_CONTROL, ord(" ")),
     ("Ctrl+Alt+Space", MOD_CONTROL | MOD_ALT, ord(" ")),
 ]
+
+BINDINGS = PRIMARY + FALLBACK
 
 LRESULT = ctypes.c_ssize_t          # 64 位下 LRESULT 是 LONG_PTR
 WNDPROC = ctypes.WINFUNCTYPE(
@@ -245,12 +278,33 @@ class Hotkeys:
 
         注意 ``ok`` 是**实际注册成功**的，不是 ``BINDINGS`` 里声明的。
         两者可能不同（被输入法等程序占用时），照实说。
+
+        ## 只把主力键摆给用户看
+
+        一共注册了 6 组，但全列出来用户记不住，反而等于没有提示。
+        所以这里**只显示 PRIMARY 里注册成功的**；主力全挂了才退而
+        显示备用的，并明确说「主力不可用」—— 那是个需要用户动作的状态，
+        藏起来会让人以为程序坏了。
         """
-        if self.ok:
-            keys = " / ".join(self.ok)
+        ok_primary = [n for n, _m, _v in PRIMARY if n in self.ok]
+        ok_fallback = [n for n, _m, _v in FALLBACK if n in self.ok]
+        ok = set(self.ok)
+
+        if ok_primary:
+            keys = " / ".join(ok_primary)
+        elif ok_fallback:
+            keys = " / ".join(ok_fallback[:2])
+            s = f"唤出：{keys}　（主力键被占用，已用备用）"
+            if self.failed:
+                s += f"　不可用：{', '.join(self.failed)}"
+            return s
         else:
             keys = "（都没注册成功）"
+
         s = f"唤出：{keys}"
+        # 只在有备用组成功时提一句「还有备用的」，不给一长串。
+        if ok_fallback:
+            s += f"　（另有 {len(ok_fallback)} 组备用）"
         if self.failed:
             s += f"　（{', '.join(self.failed)} 被占用）"
         return s

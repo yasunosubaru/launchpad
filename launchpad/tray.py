@@ -46,8 +46,8 @@ import sys
 
 from PyQt5.QtCore import QObject
 from PyQt5.QtGui import QIcon
-from PyQt5.QtWidgets import (QAction, QApplication, QMenu, QSystemTrayIcon,
-                             QWidget)
+from PyQt5.QtWidgets import (QAction, QApplication, QMenu, QMessageBox,
+                             QSystemTrayIcon, QWidget)
 
 from . import paths
 
@@ -152,6 +152,9 @@ class Tray:
         self._act_reload = QAction("重新载入图标", self._menu)
         self._act_reload.triggered.connect(self._on_reload)
 
+        self._act_diag = QAction("手势诊断", self._menu)
+        self._act_diag.triggered.connect(self._on_diagnose)
+
         self._act_quit = QAction("退出", self._menu)
         self._act_quit.triggered.connect(self._on_quit)
 
@@ -159,7 +162,53 @@ class Tray:
                   self._act_reload):
             self._menu.addAction(a)
         self._menu.addSeparator()
+        self._menu.addAction(self._act_diag)
+        self._menu.addSeparator()
         self._menu.addAction(self._act_quit)
+
+    def _on_diagnose(self) -> None:
+        """
+        弹出「手势为什么没反应」的诊断。
+
+        ## 为什么这个菜单项是必需的
+
+        手势唤出之前**完全不可观测**：统计只在启动时打一次到日志，
+        而这个程序没有控制台（pythonw），于是用户试完手势之后，
+        「到底收到了几个事件 / 是被边缘判定拒了/ 还是没攒够格数」
+        这个信息在任何地方都看不到。
+
+        结果就是每一次反馈都只是「不行」，而我只能猜——先后猜错两次：
+        先猜「钩子收不到触控板事件」（其实是探针消息循环写错），
+        再猜「DPI 坐标换算错误」（实测缩放 1.0，根本不存在）。
+
+        所以把判断依据做成一个用户能自己点的按钮：点一下就知道该调阈值
+        （报距离）还是该改动作（报事件数）。
+        """
+        hook = getattr(self._window, "_wheelhook", None)
+        if hook is None:
+            msg = ("手势唤出当前是关闭的。\n\n"
+                   "要启用：托盘右键 → 设置 → 勾选「触控板手势唤出」。\n\n"
+                   "关闭状态下不会装全局钩子，你的滚轮不会被干扰。")
+            QMessageBox.information(self._menu, "手势诊断", msg)
+            return
+        try:
+            detail = hook.diagnose()
+        except Exception as exc:
+            detail = f"诊断本身出错了：{exc!r}"
+        s = hook.stats()
+        detail += ("\n\n"
+                   f"钩子运行中：{bool(s.get('running'))}\n"
+                   f"触发带宽度：{s.get('edge_px')} px\n"
+                   f"需要格数：{int(s.get('flick_delta', 0)) // 120} 格 / "
+                   f"{s.get('flick_ms')} ms 内\n"
+                   f"收到滚轮事件：{s.get('events', 0)}\n"
+                   f"起点不在边缘被拒：{s.get('off_edge', 0)}\n"
+                   f"判定为手势：{s.get('triggers', 0)}\n"
+                   f"真正唤出：{s.get('wakes', 0)}\n\n"
+                   "动作：把指针移到屏幕左或右边缘，"
+                   "然后两指快速朝屏幕中间划两下。")
+        QMessageBox.information(self._menu, "手势诊断", detail)
+        print(f"[Tray] 手势诊断：{detail.splitlines()[0]}")
 
     # ── 对外 API ────────────────────────────────────────────
 

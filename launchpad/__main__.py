@@ -153,16 +153,18 @@ def main() -> int:
         print(f"[Tray] 托盘图标不可用：{win._tray.reason()}"
               f"（仍可用热键唤出：{_hint}）")
 
-    # 触控板手势唤出：系统级低层鼠标钩子。**默认不启用**（设置
-    # wake_gesture = True 才开）。
+    # 触控板手势唤出：系统级低层鼠标钩子。默认启用。
     #
-    # 为什么默认关：这个钩子装上之后，这台机器上的**每一次滚轮**它都看得见。
-    # 用户实测报过「鼠标滚轮一划就弹出来」——那是个真 bug（edge_px 判定被
-    # 判在了攒够阈值的那一格上，于是那道限制从没生效过），已修。但即便修好，
-    # 让一个常驻全局钩子去抢普通滚轮这件事本身就很容易惹人烦。用户说不行，
-    # 那就不默认开着；真需要的人在设置里自己打开。
+    # 用户要求「热键太难按，换成纯触摸板手势」。这台机器上四指手势不可用
+    # （通用 HID + 无厂商驱动，SM_DIGITIZER 的 DIGITIZER_TOUCHPAD 未置位），
+    # 两指从侧边划入是唯一可行方案，且实测钩子收得到合成滚轮事件
+    # （delta 规整 ±120）。
     #
-    # 装不上（策略限制、其它程序占用）也不是致命错误，打印一句就继续。
+    # 之前默认关闭是因为 edge_px 判定被判在了错误的那一格上，导致
+    # 「鼠标滚轮一划就弹」。已修，并把触发带从 40px（屏宽 2.3%，瞄不准）
+    # 放宽到 120px（屏宽 7%）。用户仍然可以随时在设置里关掉。
+    #
+    # 装不上（策略限制、其它程序占用）不是致命错误，打印一句就继续。
     try:
         if settings.get("wake_gesture"):
             from launchpad.wheelhook import WheelHook
@@ -171,17 +173,21 @@ def main() -> int:
                 is_showing=lambda: win.is_showing(),
                 flick_delta=120 * settings.get("wake_notches"),
                 edge_px=settings.get("wake_edge_px"))
+            # --verbose-wheel 把「起点不在边缘带」也记进日志。默认关，
+            # 因为屏幕中间的任何一次正常滚动都会被拒，不静音就刷爆日志。
+            # 排查「手势没反应」时才加这个参数。
+            hook._verbose = "--verbose-wheel" in sys.argv
             if hook.start():
                 win._wheelhook = hook
-                print(f"[WheelHook] 触控板手势唤出已启用："
-                      f"从屏幕左右边缘 {hook.edge_px}px 内滑入，"
-                      f"快速滑 {settings.get('wake_notches')} 格")
+                print(f"[WheelHook] 手势唤出已启用：把指针移到屏幕左/右边缘"
+                      f" {hook.edge_px}px 内，两指快速划 "
+                      f"{settings.get('wake_notches')} 下"
+                      + ("（含逐次拒绝日志）" if hook._verbose else ""))
             else:
-                print(f"[WheelHook] 未启用：热键/托盘仍可用")
+                print("[WheelHook] 未启用：热键/托盘仍可用")
         else:
-            print("[WheelHook] 触控板手势唤出：未开启"
-                  "（设置里的 wake_gesture 打开才生效；"
-                  "不开就不会装全局钩子，不碰你的滚轮）")
+            print("[WheelHook] 手势唤出：已关闭（设置里的"
+                  "「触控板手势唤出」可打开；不开就不装全局钩子）")
     except Exception as exc:
         print(f"[WheelHook] 模块不可用（不影响其它唤出方式）: {exc}")
 

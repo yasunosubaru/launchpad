@@ -512,6 +512,93 @@ if scr_ok:
 else:
     print("  [跳过] 拿不到屏幕宽度，边缘相关用例跑不了")
 
+# ─────────────────────────────────────────────────────────
+# [15] 边缘距离：_edge_ok 和 _edge_distance 必须一致
+#
+# 这两条一旦漂移，诊断面板就会报出与实际判定不同的数字 —— 而那个
+# 数字正是用户（和我）判断「该调阈值还是该改动作」的**唯一依据**。
+# 一个会说谎的诊断比没有诊断更糟。
+# ─────────────────────────────────────────────────────────
+head("[15] 边缘距离与判定必须一致（诊断不能说谎）")
+
+if scr_ok:
+    hk = WheelHook(on_wake=lambda: None, is_showing=lambda: False,
+                   edge_px=120)
+    for x in (2, 60, 119, 121, 400, sw // 2, sw - 121, sw - 119, sw - 2):
+        d = hk._edge_distance(x, 500)
+        ok = hk._edge_ok(x, 500)
+        # 判定应当恰好等价于「距离 <= 120」
+        expect = (d >= 0 and d <= 120)
+        check(f"x={x:<6} 距离={d:<6} 判定={ok} 与「距离<=120」一致",
+              ok == expect, f"期望 {expect}")
+
+    # 拿不到显示器信息时必须放行（宁可多弹，不要让功能看起来坏了）
+    hk2 = WheelHook(on_wake=lambda: None, is_showing=lambda: False,
+                    edge_px=120)
+    hk2._edge_distance = lambda *a, **k: -1
+    check("拿不到显示器信息 -> 放行（不拦用户）",
+          hk2._edge_ok(sw // 2, 500) is True)
+    check("拿不到显示器信息 -> 距离报-1（未知）而不是假装 0",
+          hk2._edge_distance(sw // 2, 500) == -1)
+else:
+    print("  [跳过] 拿不到屏幕宽度")
+
+# ─────────────────────────────────────────────────────────
+# [16] diagnose()：把「不行」翻译成具体数字
+#
+# 之前手势完全没有可观测性，用户反馈只能��「不行」，
+# 于是先后猜错两次（钩子收不到输入 / DPI 换算错）。
+# diagnose() 必须能区分这几种「不行」。
+# ─────────────────────────────────────────────────────────
+head("[16] diagnose() 能区分各种「没反应」")
+
+hk = WheelHook(on_wake=lambda: None, is_showing=lambda: False, edge_px=120)
+hk.error = "模拟：装不上"
+check("钩子没运行 -> 直接说不可用并给原因",
+      "装不上" in hk.diagnose() and "不可用" in hk.diagnose(),
+      hk.diagnose()[:40])
+
+hk2 = WheelHook(on_wake=lambda: None, is_showing=lambda: False, edge_px=120)
+hk2._hook = 12345                       # 让 running() 为真
+with hk2._lock:
+    pass
+hk2._thread = type("T", (), {"name": "t", "is_alive": lambda self: True})()
+d = hk2.diagnose()
+check("运行中但 events=0 -> 明确说「一个滚轮事件都没收到」",
+      "一个滚轮事件都没收到" in d, d[:50])
+
+hk3 = WheelHook(on_wake=lambda: None, is_showing=lambda: False, edge_px=120)
+hk3._hook = 1
+hk3._thread = type("T", (), {"name": "t", "is_alive": lambda self: True})()
+hk3._count("events", 50)
+hk3._count("off_edge", 30)
+d = hk3.diagnose()
+check("events>0 且 off_edge>0 -> 报出「被边缘拒了多少次」",
+      "30" in d and "边缘" in d, d[:60])
+
+hk4 = WheelHook(on_wake=lambda: None, is_showing=lambda: False, edge_px=120)
+hk4._hook = 1
+hk4._thread = type("T", (), {"name": "t", "is_alive": lambda self: True})()
+hk4._count("events", 20)
+d = hk4.diagnose()
+check("events>0 且 off_edge=0 -> 指向「没攒够格数」",
+      "一次都没触发" in d and "格" in d, d[:60])
+
+hk5 = WheelHook(on_wake=lambda: None, is_showing=lambda: False, edge_px=120)
+hk5._hook = 1
+hk5._thread = type("T", (), {"name": "t", "is_alive": lambda self: True})()
+hk5._count("events", 20)
+hk5._count("triggers", 3)
+hk5._count("wakes", 3)
+d = hk5.diagnose()
+check("真的触发过 -> 报出触发次数",
+      "触发 3 次" in d, d[:60])
+
+# 触发带为 0（用户显式选「不限」）时，边缘判定不该拦人
+hk6 = WheelHook(on_wake=lambda: None, is_showing=lambda: False, edge_px=0)
+check("edge_px=0 -> 不限位置",
+      hk6._edge_ok(sw // 2, 500) is True)
+
 n_pass = sum(1 for _, ok, _ in _results if ok)
 n_fail = len(_results) - n_pass
 print()

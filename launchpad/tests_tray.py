@@ -47,6 +47,7 @@ from PyQt5.QtWidgets import QApplication, QSystemTrayIcon           # noqa: E402
 
 app = QApplication(sys.argv)
 
+from launchpad import hotkeys as HK                                  # noqa: E402
 from launchpad import shortcuts as SC                              # noqa: E402
 from launchpad import tray as T                                    # noqa: E402
 from launchpad.library import Entry, Library                       # noqa: E402
@@ -332,7 +333,77 @@ check("Startup .lnk 没被打开设置界面写回来",
 check("桌面 .lnk 没被打开设置界面写回来",
       SC.desktop_link().exists() == _desktop_before)
 
-head("[12] 收尾")
+head("[12] 热键分组：主力只有 Alt+Space，备用不打扰用户")
+# 用户报「热键太难按」：Ctrl+Alt+K 要从home 位伸手到字母区。
+# 改成底排的 Alt+Space（左手不用移动）。这里锁住那个决定，
+# 以及「tooltip 只显示主力」这条 UX —— 一次列 7 组等于没提示。
+from launchpad.hotkeys import FALLBACK, PRIMARY                      # noqa: E402
+
+P = [n for n, _m, _v in PRIMARY]
+F = [n for n, _m, _v in FALLBACK]
+check("主力键是 Alt+Space", P == ["Alt+Space"], str(P))
+check("主力恰好一个（用户只需记一个）", len(PRIMARY) == 1, str(len(PRIMARY)))
+check("备用组仍有内容（主力被占时能顶上）", len(FALLBACK) >= 2, str(len(F)))
+check("主力不出现在备用里（否则分组无意义）",
+      not (set(P) & set(F)), str(set(P) & set(F)))
+
+
+def _hk(ok, failed):
+    """造一个只填了 ok/failed 的 Hotkeys，不起线程、不碰真实热键。"""
+    h = HK.Hotkeys(lambda: None)
+    h.ok = list(ok)
+    h.failed = list(failed)
+    return h
+
+
+s = _hk(P, []).summary()
+check("一切正常时 tooltip 只显示 Alt+Space",
+      s.split("（")[0] == "唤出：Alt+Space", repr(s))
+check("正常时首段不含任何备用键",
+      "F9" not in s.split("（")[0] and "Ctrl" not in s.split("（")[0],
+      repr(s.split("（")[0]))
+# 这份 fixture 里备用组一个都没注册成功，所以**不该**出现「另有 N 组备用」。
+# 沉默是对的：没备用的提示等于噪音。
+check("备用全挂时不谎报「另有备用」", "备用" not in s, repr(s))
+
+s = _hk(P + F, []).summary()
+check("备用都在时说明「另有 6 组备用」但不列具体键",
+      "另有 6 组备用" in s and "F9" not in s, repr(s))
+
+s = _hk(F, P).summary()
+check("主力被占时明说「主力键被占用」", "主力键被占用" in s, repr(s))
+check("主力被占时顶上一个备用键", "唤出：Ctrl" in s or "唤出：Alt" in s, repr(s))
+check("主力被占时把不可用的列出来", "Alt+Space" in s, repr(s))
+
+s = _hk([], P + F).summary()
+check("全挂时说清「都没注册成功」", "都没注册成功" in s, repr(s))
+
+s = _hk([], []).summary()
+check("空状态（刚new 出来）也不崩、也不谎报",
+      "都没注册成功" in s, repr(s))
+
+s = _hk(P + ["F9"], ["Ctrl+Space", "Ctrl+\\"]).summary()
+# 首段仍是主力；后面才跟「另有 1 组备用」和被占用的列表。
+# 注意用 startswith 而不是 split("（")[0] —— 分隔符是**全角空格**，
+# split 出来的首段会带上它，精确等于的断言会假失败。
+check("部分备用挂掉不影响主力显示",
+      s.startswith("唤出：Alt+Space"), repr(s))
+# 这份 fixture 里备用只有 F9 注册成功 ->「另有 1 组备用」。
+# 数字必须跟着实际注册结果走，不能写死。
+check("备用数量如实反映（6 组里只剩 F9）",
+      "另有 1 组备用" in s, repr(s))
+check("被占用的键如实列出",
+      "Ctrl+Space" in s, repr(s))
+
+# 实际注册一次，确认 Alt+Space 在本机真的可用（不发按键）
+_h = HK.Hotkeys(lambda: None)
+if _h.start():
+    check("Alt+Space 在本机注册成功", "Alt+Space" in _h.ok, str(_h.ok))
+    _h.stop()
+else:
+    check("Hotkeys.start() 返回 True", False, str(_h.failed))
+
+head("[13] 收尾")
 win.close()
 win.deleteLater()
 app.processEvents()
