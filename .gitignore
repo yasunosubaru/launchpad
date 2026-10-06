@@ -6,6 +6,15 @@ __pycache__/
 venv/
 env/
 
+# 打包产物（PyInstaller）
+#   build/    构建中间文件
+#   dist/     成品 exe —— 分发时用户自己跑 build.py 再来一份，
+#             不该进仓库（体积大，且每个机器不一样）
+#   *.spec    PyInstaller 生成的配置文件，由 build.py 控制，不作为事实源
+build/
+dist/
+*.spec
+
 # 测试产物
 # tools/shots/ 里的截图是**真实启动器的原图**，含本机所有应用的名字。
 # 任何基于 grep 的扫描都看不到这一点（二进制），所以必须靠 .gitignore 挡住。

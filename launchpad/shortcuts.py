@@ -87,6 +87,134 @@ _SHELL_FOLDERS_KEY = (r"Software\Microsoft\Windows\CurrentVersion"
 
 # ── 路径计算（纯读，不创建任何东西） ──────────────────────
 
+def package_root() -> Path | None:
+    """
+    ``launchpad`` 包的父目录（也就是仓库根），**找不到就返回 None**。
+
+    只在**源码运行**时用来生成一条带绝对路径的启动命令；打包成 exe 之后
+    用不到（exe 自己就是入口）。
+
+    判据用「这个文件存在吗」而不是「有没有 ``__init__.py``」：
+    ``launchpad`` 目录本身没有 ``__init__.py``（命名空间包），拿它当
+    判据会永远返回 None —— 而那正是「以为配好了其实没配」的形态。
+    """
+    try:
+        f = Path(__file__).resolve()
+    except OSError:
+        return None
+    for parent in f.parents:
+        if (parent / "launchpad" / "__main__.py").is_file():
+            return parent
+    return None
+
+
+def bundled_exe() -> Path | None:
+    """
+    打包好的 ``Launchpad.exe``，**没打包就返回 None**。
+
+    源码运行时也应该优先用它：exe 是自包含的，不依赖``python.exe``、
+    不依赖解释器版本、不依赖工作目录 —— 而源码模式依赖这三样。
+    找不到（没跑 ``build.py``）才退回源码模式。
+
+    存在性判据用「路径就是文件」，并且顺手确认它**旁边有 assets/**——
+    缺了assets 的话托盘图标和快捷方式 ``IconLocation`` 都会指向不存在的
+    文件，那种情况下用一个残缺的 exe 比用源码更糟。
+    """
+    root = package_root()
+    if root is None:
+        return None
+    for cand in (root / "dist" / "Launchpad" / "Launchpad.exe",
+                 root / "dist" / "Launchpad.exe"):
+        try:
+            if cand.is_file() and (cand.parent / "assets").is_dir():
+                return cand
+        except OSError:
+            pass
+    return None
+
+
+def launch_command() -> str:
+    """
+    能从**任意工作目录**启动本程序的完整命令（给注册表 Run / .lnk 用）。
+
+    ## 打包成 exe（正常情况，也是优先选的）
+
+    直接返回 exe 的绝对路径。exe 是自包含的：不依赖 ``python.exe``、
+    不依赖 ``PYTHONPATH``、**也不依赖当前工作目录** —— 这三个依赖正是
+    下面那个 bug 的全部成因。
+
+    即使当前是源码运行（``sys.frozen`` 为假），只要 ``dist/`` 下有打包
+    好的 exe，也优先用它 —— 用户要的是「双击一个程序」，不是「装好
+    Python 才能跑」。
+
+    ## 源码运行（没打包时的退路）
+
+    ``-m launchpad`` 靠**当前工作目录**找包，而注册表 Run 项没有 cwd
+    （由 ``CreateProcess`` 解析，不是 cmd）。实测：把
+    ``"<pythonw>" -m launchpad`` 写进Run 键后，开机自启**一个进程都没
+    起来、日志零写入** —— Python 拿 ``%WINDIR%\\System32`` 当基准，
+    找不到包；``pythonw.exe`` 又没有控制台，于是**静默失败**：注册表里
+    明明有一条 ``Launchpad`` 值，程序也「装了」，但按热键永远没反应。
+
+    这里用 ``-c`` 把包路径写死在代码里，而不是靠 cwd：
+
+    .. code-block:: python
+
+        "<pythonw>" -c "import sys; sys.path.insert(0, r'<root>'); \\
+                        import runpy; runpy.run_module('launchpad', run_name='__main__')"
+
+    为什么不用 ``set "PYTHONPATH=..." && ...``：Run 项的值**只有命令行、
+    没有环境变量**，由 ``CreateProcess`` 解析；``set`` 是 cmd 的内建命令，
+    没人会执行它 —— 写进去就是一条永远启动失败、读回来却「看起来正常」
+    的死条目。``cd /d`` 同理。
+    """
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable).resolve()}"'
+
+    # 源码运行，但 dist/ 下有打包好的 exe —— 用 exe。
+    bundled = bundled_exe()
+    if bundled is not None:
+        return f'"{bundled}"'
+
+    root = package_root()
+    exe = python_exe()
+    if root is None:
+        # 找不到仓库根（如被装成 site-packages 里的包）。如实降级成
+        # 原来的写法并说明，而不是假装这条能用。
+        return f'"{exe}" -m launchpad'
+    code = (f"import sys; sys.path.insert(0, r'{root}'); "
+            f"import runpy; runpy.run_module('launchpad', "
+            f"run_name='__main__')")
+    return f'"{exe}" -c "{code}"'
+
+
+def _split_command(cmd: str) -> tuple[str, str]:
+    """
+    把 ``launch_command()`` 拆成 ``(TargetPath, Arguments)``。
+
+    只按**第一个**引号对拆，因为 ``launch_command()`` 只会生成两种形状：
+
+    * 打包后的 exe —— ``"C:\\...\\Launchpad.exe"``（没有参数）
+    * 源码运行 —— ``"C:\\...\\pythonw.exe" -c "import sys; ..."``
+
+    后者的 ``-c`` 参数**自身含引号和空格**，用 ``shlex`` 之类的通用拆分器
+    会把它切碎、还得处理转义。这里按结构拆更简单也更准：Target 是第一段
+    引号内的内容，其余原样作为 Arguments。引号缺失时（理论上不该发生，
+    但别让一条坏命令把快捷方式写崩）退回「第一个空格」。
+    """
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return python_exe(), ""
+    if cmd.startswith('"'):
+        end = cmd.find('"', 1)
+        if end > 0:
+            return cmd[1:end], cmd[end + 1:].strip()
+    sp = cmd.find(" ")
+    if sp < 0:
+        return cmd, ""
+    return cmd[:sp], cmd[sp + 1:].strip()
+
+
 def python_exe() -> str:
     """
     快捷方式要指向的解释器。返回绝对路径。
@@ -123,17 +251,38 @@ def app_icon() -> str:
     """
     自带图标 ``assets/launchpad.ico`` 的绝对路径；**不存在时返回空串**。
 
+    ## 打包后要指向 **exe 旁边**那份，不是仓库里那份
+
+    ``IconLocation`` 是一个**写进快捷方式的绝对路径**，会被持久化到磁盘。
+    指向仓库里的 ``assets/`` 有两个问题：
+
+    1. 把 ``dist/Launchpad/`` 整个目录拷给别人（或装到另一台机器）时，
+       快捷方式指向的路径根本不存在 —— 壳层取不到图标就显示**空白图标**，
+       而且**不报任何错**（这就是当初为什么必须显式设 ``IconLocation``）。
+    2. 仓库移动/重命名之后，已有的快捷方式全部失效。
+
+    所以打包后优先用 exe 旁边的 ``assets/`` —— 那一份跟着程序走。
+
     返回空串而不是抛异常或返回一条坏路径，是因为调用方要靠它决定
     「要不要设 IconLocation」。图标可能没生成（``make_icon.py`` 没跑），
     也可能整个 ``assets/`` 没跟着目录拷过来 —— 这两种都不该让
     「修图标」这件事整体失败。
     """
-    try:
-        p = app_icon_file()
-        if p.is_file():
-            return str(p)
-    except OSError:
-        pass
+    candidates = []
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent
+                          / "assets" / "launchpad.ico")
+    exe = bundled_exe()
+    if exe is not None:
+        candidates.append(exe.parent / "assets" / "launchpad.ico")
+    candidates.append(app_icon_file())
+
+    for p in candidates:
+        try:
+            if p.is_file():
+                return str(p)
+        except OSError:
+            pass
     return ""
 
 
@@ -355,8 +504,13 @@ def write_shortcut(path: Path, show: bool) -> bool:
         shell = win32com.client.Dispatch("WScript.Shell")
 
         sc = shell.CreateShortcut(str(tmp))
-        sc.TargetPath = python_exe()
-        sc.Arguments = "-m launchpad --show" if show else "-m launchpad"
+        # Target/Arguments 从 launch_command() 拆出来，而不是各写各的 ——
+        # 两处各写一遍必然漂移：改了命令格式就只改了一边，产出一个
+        # Target 是新版、Arguments 是旧版的快捷方式。
+        cmd = launch_command()
+        sc.TargetPath, sc.Arguments = _split_command(cmd)
+        if show:
+            sc.Arguments = (sc.Arguments + " --show").strip()
         sc.WorkingDirectory = str(install_root())
         sc.Description = _DESCRIPTION
 
@@ -490,7 +644,14 @@ def set_autostart(on: bool) -> bool:
                 # 不加引号 Explorer 会在第一个空格处截断命令，得到一条
                 # 永远启动失败的死条目，而且完全看不出哪里错了 ——
                 # 注册表里读回来是「有一条 Launchpad 值」，看起来一切正常。
-                command = f'"{python_exe()}" -m launchpad'
+                #
+                # 用 launch_command() 而不是 ``-m launchpad``：Run 项由
+                # CreateProcess 解析、**没有 cwd**，而 ``-m`` 靠 cwd 找包。
+                # 实测写 ``"<pythonw>" -m launchpad`` 之后开机自启**一个
+                # 进程都没起来、日志零写入**，而注册表读回来完全正常 ——
+                # pythonw 没有控制台，import 失败这件事没有任何出口。
+                # 打包成 exe 后这条命令就是 exe 本身，三个依赖全都没有。
+                command = launch_command()
                 winreg.SetValueEx(key, _RUN_VALUE, 0, winreg.REG_SZ,
                                   command)
             else:

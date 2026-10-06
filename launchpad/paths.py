@@ -4,6 +4,7 @@
 """
 
 import os
+import sys
 from pathlib import Path
 
 APP_DIR_NAME = "Launchpad"
@@ -121,4 +122,22 @@ DEFAULT_SOURCE = _default_source()
 
 
 def install_root() -> Path:
+    """
+    「资源根目录」——``assets/`` 就在它下面。
+
+    ## 打包成 exe 后（PyInstaller）
+
+    ``sys.frozen`` 为真时 ``__file__`` 指向 PyInstaller 的**临时解包目录**
+    （``%TEMP%`` 下的 ``_MEIxxxxxx``），程序退出就被删。而 ``assets/`` 里的
+    ``launchpad.ico`` 是**要留下**的：托盘图标、开始菜单快捷方式、
+    ``IconLocation`` 都要用它 —— 指向一个临时目录的话，图标在程序退出后
+    就成了死链接，壳层读不到就显示空白图标，而且**没有任何报错**。
+
+    所以打包后必须回到**exe 所在目录**找资源。这也是``onefile`` 的
+    常规做法：exe 旁边放一个 ``assets/`` 目录。
+
+    打不成 frozen（源码运行）时就是仓库根 —— 行为与之前完全一致。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[1]
