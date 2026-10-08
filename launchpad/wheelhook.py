@@ -420,6 +420,9 @@ class WheelHook:
         #: —— 这里曾经是个 bug：前提被判在了错误的那一格上（攒够阈值的那
         #: 格恰好 started=False），于是 edge_px 从来没生效过。
         self._gesture_ok = False
+        #: 最近一次手势起点的光标坐标，供诊断用。见下面触发时的日志。
+        self._gesture_x = -1
+        self._gesture_y = -1
         #: 最近一次手势起点离屏幕边缘的距离（px），供诊断用。-1 = 未知。
         #: 有它才能在用户说「没反应」时直接报出「差 340px，阈值 120px」，
         #: 而不是又一次靠猜。
@@ -428,6 +431,8 @@ class WheelHook:
         #: 在屏幕中间进行时**每一次**都会被拒，不静音的话日志会被刷爆，
         #: 真正有用的触发记录反而被埋掉。设True 只用于排查。
         self._verbose = False
+        #: 上次写「限流拒绝日志」的时刻（ms）。见 :meth:`_log_rejection`。
+        self._last_reject_log_ms = -10 ** 9
         self._hook_proc = None       # HOOKPROC 实例，必须保活（见下方注释）
         self._bridge = None
         self._thread = None
@@ -552,6 +557,8 @@ class WheelHook:
         s["gesture_ok"] = self._gesture_ok
         s["edge_px"] = self.edge_px
         s["last_edge_dist"] = self._last_edge_dist
+        s["last_gesture_x"] = self._gesture_x
+        s["last_gesture_y"] = self._gesture_y
         s["verbose"] = self._verbose
         s["ignore_injected"] = self.ignore_injected
         s["flick_delta"] = self._flick.threshold
@@ -604,6 +611,35 @@ class WheelHook:
     def _count(self, key: str, n: int = 1) -> None:
         with self._lock:
             self._stat[key] += n
+
+    # 限流拒绝日志的最小间隔（毫秒）。
+    _REJECT_LOG_EVERY_MS = 10_000
+
+    def _log_rejection(self, now_ms: int) -> None:
+        """
+        「起点不在边缘带」的**限流**日志。
+
+        ## 为什么要有它
+
+        触发那一行本来就无条件写日志，所以「误触」本身留下了记录。缺的是
+        **分母**：没有「被正确拒掉多少次、拒的时候光标在哪」，就无法回答
+        「边缘带到底收窄到多少才既不误触、又能瞄得中」—— 这正是用户报
+        「滚轮一划就弹出来」时唯一需要的那组数。
+
+        逐次写会刷爆日志（屏幕中间的任何一次正常滚动都会被拒），所以只写
+        每 :attr:`_REJECT_LOG_EVERY_MS` 毫秒的一条，并把累积计数带上：
+        看到「第 7 次拒绝（累计 1284 次）」就知道分母有多大。
+
+        只在**非 verbose** 下走这条；``--verbose-wheel`` 仍然逐次写。
+        """
+        with self._lock:
+            if now_ms - self._last_reject_log_ms < self._REJECT_LOG_EVERY_MS:
+                return
+            self._last_reject_log_ms = now_ms
+            n = self._stat["off_edge"]
+        print(f"[WheelHook] 手势被边缘门拒绝（第 {n} 次，限流）："
+              f"起点 ({self._gesture_x}, {self._gesture_y}) 离边缘 "
+              f"{self._last_edge_dist}px > 阈值 {self.edge_px}px")
 
     def _count_trigger(self, delta: int) -> None:
         with self._lock:
@@ -740,6 +776,8 @@ class WheelHook:
         if flick.is_start(now_ms):
             # y 一起传：多屏上下排列时，同一个 x 可能落在两块屏上，
             # 只看 x 会把「上面那块屏的中间」误判成贴边。
+            self._gesture_x = int(hs.pt.x)
+            self._gesture_y = int(hs.pt.y)
             self._gesture_ok = self._edge_ok(hs.pt.x, hs.pt.y)
             self._last_edge_dist = self._edge_distance(hs.pt.x, hs.pt.y)
             if not self._gesture_ok:
@@ -752,6 +790,8 @@ class WheelHook:
                     print(f"[WheelHook] 手势起点离边缘 "
                           f"{self._last_edge_dist}px（阈值 "
                           f"{self.edge_px}px），不触发")
+                else:
+                    self._log_rejection(now_ms)
 
         # **无论手势合不合格都要 feed。**
         #
@@ -769,9 +809,14 @@ class WheelHook:
 
         if fired:
             self._count_trigger(delta)
-            print(f"[WheelHook] 手势触发：起点离边缘 "
-                  f"{self._last_edge_dist}px，delta={delta}，"
-                  f"累积 {self._flick.accum}/{self._flick.threshold}")
+            # 光标坐标一并记下来：只记「离边缘多少像素」看不出**是哪一种
+            # 误触**。用户报「往下滚滚轮就会弹出来」时，唯一能分辨的
+            # 办法是看那个坐标是不是落在滚动条上（x ≈ 屏幕宽度 - 17）
+            # —— 而滚动条就在屏幕最右缘，任何合理的边缘带都盖住了它。
+            print(f"[WheelHook] 手势触发：起点 ({self._gesture_x},"
+                  f"{self._gesture_y}) 离边缘 {self._last_edge_dist}px，"
+                  f"delta={delta}，累积 {self._flick.accum}/"
+                  f"{self._flick.threshold}")
             bridge = self._bridge
             if bridge is not None:
                 # 唯一的跨线程动作，QueuedConnection 把它排到 GUI 线程。

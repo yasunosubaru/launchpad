@@ -121,6 +121,13 @@ def build() -> None:
     t0 = time.monotonic()
     log(f"解释器：{sys.executable}")
 
+    # 必须在 PyInstaller **之前**清场，不是只在 smoke_test 里清。
+    # COLLECT 阶段要 rmtree 整个 dist/Launchpad/，而正在运行的 exe 被
+    # Windows 锁着 -> PermissionError: [WinError 5] 拒绝访问，打包直接失败。
+    # 这个失败信息还指向 shutil/rmtree，跟「有个旧实例没退」毫无关系，
+    # 光看栈根本想不到要先杀进程。
+    _kill_all_instances()
+
     # PyInstaller 在自己 import 时
     try:
         import PyInstaller  # noqa: F401
@@ -246,9 +253,62 @@ def log_path() -> Path:
     return Path(os.environ.get("APPDATA", ".")) / "Launchpad" / "launchpad.log"
 
 
+def _kill_all_instances() -> None:
+    """
+    停掉**所有形态**的 Launchpad：打包的 exe + 源码模式的 pythonw。
+
+    为什么必须连源码模式一起杀：单实例互斥体是跨形态共享的，任何一个
+    实例占着它，新起的那个就会被挡掉、立刻退出 —— 于是启动自检看不到
+    任何日志变化，看起来像「exe 起不来」，其实是被自己人挡住了。
+    只杀 ``Launchpad.exe`` 不够：开发时后台常留着一个
+    ``pythonw.exe -m launchpad``。
+
+    不用 ``taskkill /IM pythonw.exe``：那会连带杀掉机器上所有 pythonw
+    （别的项目的后台服务也在里面），代价太大。
+
+    ## 判据必须匹配「真正的入口」，不能只匹配 launchpad 这个词
+
+    第一版写的是 ``$_.CommandLine -match 'launchpad'``，结果是
+    **build.py 把自己杀了**（实测 rc=-1、输出只剩「解释器：…」一行）：
+    它由 ``.venv\\Scripts\\python.exe -u build.py`` 启动，PowerShell
+    记进 WMI 的是**解析后的绝对路径**，里面就含
+    ``…\\apps\\Launchpad\\.venv\\…`` —— 于是这个正则命中了打包脚本自己。
+
+    所以只认三种**确实在跑启动器**的形状，另外无条件排除自己：
+
+    * ``-m launchpad``
+    * ``launchpad\\__main__.py``（含 ``launchpad/__main__.py``）
+    * ``Launchpad.exe``（由上面那条 taskkill 覆盖，这里不重复）
+    """
+    import os
+    import subprocess
+
+    subprocess.run(["taskkill", "/F", "/IM", f"{NAME}.exe"],
+                   capture_output=True)
+    # [^\s] 是为了不匹配 `-m launchpad.tests_wheelhook` 这种测试进程 ——
+    # 它们只是 import 了一下包，不是运行中的启动器实例。
+    pattern = r"-m\s+launchpad(\s|$)|launchpad[\\/]__main__"
+    ps = ("Get-CimInstance Win32_Process -Filter "
+          "\"Name='python.exe' OR Name='pythonw.exe'\" | "
+          f"Where-Object {{ $_.ProcessId -ne {os.getpid()} -and "
+          f"$_.CommandLine -match '{pattern}' }} | "
+          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
+    subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                   capture_output=True)
+
+
+def _start_lines(logp: Path) -> int:
+    """日志里 ``[Main] 启动`` 出现的次数（读不出来当 0）。"""
+    try:
+        body = logp.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    return body.count("[Main] 启动")
+
+
 def smoke_test(exe: Path, logp: Path) -> bool:
     """
-    真起一次 exe，看日志有没有被写。
+    真起一次 exe，看它有没有**自己写出启动日志**。
 
     ## 为什么必须有这一步
 
@@ -258,20 +318,35 @@ def smoke_test(exe: Path, logp: Path) -> bool:
     模块 import 全部失败 —— 而 GUI 子系统 exe 没有 stdout/stderr，
     那些异常**一个字都看不见**。
 
-    静态检查证明不了「能启动」。唯一的判据是：日志文件被写了。
-    启动器第一件事就是 ``install_log()``，所以它的mtime 变化 = 真的
-    跑起来了。
+    静态检查证明不了「能启动」。启动器第一件事就是 ``install_log()``，
+    所以判据是：日志里**新增**了一条 ``[Main] 启动``。
+
+    ## 为什么数行数而不是比 mtime
+
+    第一版比 mtime，结果**假阳性过一次**：那一次 exe 压根没写日志
+    （``log.install()`` 见到 windowed 的 ``sys.stdout is None`` 就跳过
+    安装），可就在那 30 秒的等待窗口里，一个还没退干净的源码实例往同一
+    个日志文件里写了一行 —— mtime 变了 -> 自检报「启动成功」-> 我据此
+    宣布打包没问题，实际交付了一个零输出的程序，还把它当成基线沿用了
+    两天。
+
+    mtime 会被**任何**写这个文件的进程推动；「新增了一条启动记录」不会。
+    所以这里数行数，并且先把两种形态的实例全部清干净。
     """
     import subprocess
     import time
 
-    # 先停掉已有实例，否则单实例互斥体会把新起的这个挡掉，
-    # 于是日志不动 —— 看起来像失败，其实是互斥体在工作。
-    subprocess.run(["taskkill", "/F", "/IM", f"{NAME}.exe"],
-                   capture_output=True)
-    time.sleep(1.2)
+    _kill_all_instances()
+    # 互斥体随进程释放，得给它一点时间
+    for _ in range(6):
+        time.sleep(0.5)
+        out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {NAME}.exe"],
+                             capture_output=True).stdout.decode(
+                                 "utf-8", "replace")
+        if NAME not in out:
+            break
 
-    before = logp.stat().st_mtime if logp.exists() else 0.0
+    before = _start_lines(logp)
     try:
         subprocess.Popen([str(exe)], cwd=r"C:\Windows\System32",
                          stdout=subprocess.DEVNULL,
@@ -281,22 +356,24 @@ def smoke_test(exe: Path, logp: Path) -> bool:
         return False
 
     # 等它初始化（导入 Qt + 读图标缓存，冷启动可能要几秒）
-    changed = False
+    grew = False
     for _ in range(30):
         time.sleep(1.0)
-        after = logp.stat().st_mtime if logp.exists() else 0.0
-        if after > before:
-            changed = True
+        if _start_lines(logp) > before:
+            grew = True
             break
 
     subprocess.run(["taskkill", "/F", "/IM", f"{NAME}.exe"],
                    capture_output=True)
 
-    if not changed:
-        log(f"    日志 mtime 没变（{logp}）")
-        log("    常见原因：1) --collect-submodules launchpad 没加"
-            "（命名空间包会被漏掉）")
-        log("              2) 单实例互斥体被别的实例占着")
+    if not grew:
+        log(f"    日志里没有新增 [Main] 启动 行（现有 {before} 条）")
+        log("    逐条排查：")
+        log("      1) --collect-submodules launchpad 没加？"
+            "（命名空间包会被静态分析漏掉，import 全炸）")
+        log("      2) log.install() 退回成「stdout 为 None 就不装」？"
+            "（PyInstaller --windowed 就是把 stdout 设成 None）")
+        log("      3) 单实例互斥体被别的实例占着")
         return False
 
     try:

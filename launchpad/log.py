@@ -173,6 +173,33 @@ def install() -> str:
 
     必须在 ``main()`` 的**第一行**附近调用，否则前面的 print 不会进文件。
     重复调用是安全的（第二次直接返回）。
+
+    ## 原流是 ``None`` 时**照样装**（这一条是打包之后才暴露的）
+
+    第一版写成::
+
+        if sys.stdout is not None:
+            sys.stdout = _Tee(sys.stdout, path)
+
+    那个 ``is not None`` 判断看起来是「防御性编程」，实际上造成了一个
+    **只在打包后才出现、而且完全静默**的故障：PyInstaller 的
+    ``--windowed``（GUI 子系统）按其既定行为把 ``sys.stdout`` /
+    ``sys.stderr`` 设成 ``None`` —— 官方文档原话是「standard streams
+    are unavailable」。于是条件恒为假 -> 日志永远不装 -> 程序零输出。
+
+    实测（不是推断）：双击 ``dist\\Launchpad\\Launchpad.exe`` 起第二个
+    实例，它被单实例互斥体挡掉后立刻退出，而 ``main()`` 里
+    ``install_log()`` 在 ``acquire_single_instance()`` **之前**，本该至少
+    写一行 ``[Main] 启动`` —— 日志 mtime **零变化**。此后两整天，程序里
+    发生的任何事都留不下痕迹，包括「手势被误触发」这种只有日志能回答的
+    问题：症状是「滚轮一划就弹出来」，而判据（手势起点离边缘多少像素、
+    攒了多少 delta）只存在于那行 ``print`` 里。
+
+    所以这里**无条件**装，原流是 ``None`` 就把 ``None`` 交给
+    :class:`_Tee` —— 它的 ``write`` 本来就处理了 ``orig is None``
+    （:meth:`_Tee.write` 里那个分支）。判断放在这里等于把「有没有地方
+    输出」和「要不要记日志」混成一件事，而这两件事在无控制台程序里
+    恰好是**相反**的。
     """
     global _installed
     path = log_file()
@@ -180,10 +207,8 @@ def install() -> str:
         return path
     _installed = True
     try:
-        if sys.stdout is not None:
-            sys.stdout = _Tee(sys.stdout, path)
-        if sys.stderr is not None:
-            sys.stderr = _Tee(sys.stderr, path)
+        sys.stdout = _Tee(getattr(sys, "stdout", None), path)
+        sys.stderr = _Tee(getattr(sys, "stderr", None), path)
     except Exception:
         # 套壳失败也绝不影响启动
         pass

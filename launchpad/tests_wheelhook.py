@@ -599,6 +599,107 @@ hk6 = WheelHook(on_wake=lambda: None, is_showing=lambda: False, edge_px=0)
 check("edge_px=0 -> 不限位置",
       hk6._edge_ok(sw // 2, 500) is True)
 
+# ── [17] 默认关闭，且参数随开关一起不生效 ─────────────────
+#
+# 这个默认值改过两次，两次都被用户报「鼠标滚轮一划就弹出来」推翻。理由
+# 写在 settings.SCHEMA 的 wake_gesture 注释里，简短版是：Windows 上两指
+# 滑动**不移动光标**，WM_MOUSE_WHEEL 里没有手指方向这个字段，所以
+# 「起点在边缘」测的是「光标碰巧停在边上」，而滚动条就在屏幕最右 17px。
+# 没有可靠信号能区分触控板轻弹和滚轮快滚 —— 所以默认不赌它。
+#
+# 断言的是**属性**（「默认不装钩子」），不是「某个常量等于 False」：
+# 前者在有人改实现方式时仍然成立，后者一改就假失败。两种都断，且都断在
+# 真正要紧的那件事上。
+print()
+print("=" * 72)
+print("[17] 触控板手势默认关闭")
+print("=" * 72)
+
+from launchpad.settings import SCHEMA, Settings             # noqa: E402
+
+check("SCHEMA 里 wake_gesture 的默认值是 False",
+      SCHEMA["wake_gesture"][0] is False,
+      f"实际 {SCHEMA['wake_gesture'][0]!r}")
+
+# **必须给一个临时路径。** ``Settings()`` 不带参数会用
+# ``%APPDATA%\\Launchpad\\settings.json``，而 ``save()`` 会把当前内存里
+# 的全部键写回去 —— 于是「读一下默认值再存一下」这个操作会把用户的
+# 配置整个盖成默认值。
+#
+# 第一版这个测试就是这么写的，然后顺手 ``save()`` 了一次，把用户真实的
+# settings.json 覆盖了。当时侥幸没损失（那些值本来就是默认值），但
+# 「侥幸」不是设计：一个测试碰真实用户配置，任何一次都不该被接受。
+#
+# 顺带一个更要命的坑：``Settings.__init__`` **不调用** ``load()``。
+# 所以 ``Settings().get(k)`` 拿到的是 SCHEMA 默认值，跟磁盘上的文件
+# 毫无关系 —— 第一版「改之前 wake_gesture = False」那行输出因此毫无
+# 意义（它读的是刚改过的默认值，不是文件）。下面每个用例都显式
+# ``load()``。
+_tmpdir = Path(tempfile.mkdtemp(prefix="lp_wake_"))
+_clean = Settings(_tmpdir / "fresh.json")
+check("没有配置文件时取默认值 = False",
+      bool(_clean.get("wake_gesture")) is False,
+      f"实际 {_clean.get('wake_gesture')!r}")
+
+# 显式开过的人，升级后仍然是开的 —— 默认值只决定「新装」，
+# 不覆盖已经写进文件的用户选择。
+_onfile = _tmpdir / "on.json"
+_onfile.write_text('{"wake_gesture": true}', encoding="utf-8")
+_on = Settings(_onfile)
+_on.load()
+check("文件里写了 true -> 仍然生效（默认值不覆盖用户选择）",
+      bool(_on.get("wake_gesture")) is True,
+      f"实际 {_on.get('wake_gesture')!r}")
+
+# 显式关过的，也还是关的。
+_offfile = _tmpdir / "off.json"
+_offfile.write_text('{"wake_gesture": false}', encoding="utf-8")
+_off = Settings(_offfile)
+_off.load()
+check("文件里写了 false -> 仍然是关的",
+      bool(_off.get("wake_gesture")) is False)
+
+# 「默认关」不等于「焊死」：能在内存里改，也能存回去。
+_clean.set("wake_gesture", True)
+check("用户仍可显式打开（改内存后读到 True）",
+      bool(_clean.get("wake_gesture")) is True)
+_clean.save()
+_reloaded = Settings(_tmpdir / "fresh.json")
+_reloaded.load()
+check("打开后能存盘并读回来",
+      bool(_reloaded.get("wake_gesture")) is True)
+_reloaded.set("wake_gesture", False)
+_reloaded.save()
+_again = Settings(_tmpdir / "fresh.json")
+_again.load()
+check("也能再关回去并持久化（幂等）",
+      bool(_again.get("wake_gesture")) is False)
+
+# 热键唤出必须**不受**这个开关影响 —— 这是「关掉手势」的前提。
+# 断言 PRIMARY 在绑定表里，而不是去跑 start()（那会和真机上已注册的
+# 热键打架，属于环境干扰不是被测行为）。
+#
+# 每条绑定是 ``(标签, vk, mod)`` 三元组，标签形如 "Alt+Space"。所以
+# 「两只手都在底排」要对着**标签里的键名**判，不是对元组本身判 ——
+# 第一版写成 `all(k in ("Alt","Space") for k in PRIMARY)`，把三元组
+# 当键名比，永远为假。
+from launchpad.hotkeys import BINDINGS, PRIMARY            # noqa: E402
+
+#: 底排键。左手不用离开 home位是这个方案的立足点，别让它悄悄挪走。
+BOTTOM_ROW = {"Alt", "Space", "Ctrl", "Shift", "Win", "CapsLock"}
+
+check("热键唤出与手势开关无关（PRIMARY 仍在绑定表里）",
+      len(PRIMARY) == 1 and len(BINDINGS) >= 1,
+      f"PRIMARY={PRIMARY} 共 {len(BINDINGS)} 组")
+
+_label = PRIMARY[0][0] if PRIMARY else ""
+_keys = set(_label.split("+"))
+check("主力热键是 Alt+Space",
+      _label == "Alt+Space", f"实际 {_label!r}")
+check("主力热键的每个键都在底排",
+      _keys <= BOTTOM_ROW and bool(_keys),
+      f"键={sorted(_keys)}")
+
 n_pass = sum(1 for _, ok, _ in _results if ok)
 n_fail = len(_results) - n_pass
 print()
@@ -610,8 +711,12 @@ for name, ok, detail in _results:
 print("=" * 72)
 print()
 print("提醒：以上全部是状态机与装卸钩子的验证。")
-print("真实手指的两指滑动**无法用自动化验证**（见模块 docstring），")
-print("请手动试一次：收起状态下两指快速连滑两格。")
+print("真实手指的两指滑动**无法用自动化验证**（见模块 docstring）。")
+print("而且它**默认是关的**——Windows 上两指滑动不移动光标，")
+print("WM_MOUSE_WHEEL 里没有手指方向这个字段，没法把「触控板轻弹」")
+print("和「鼠标滚轮快滚两下」分开，滚动条又正好在屏幕最右 17px。")
+print("想要的话去「设置 → 系统集成 → 触控板手势唤出」打开，然后")
+print("收起状态下两指快速连滑两格试一次。")
 print("=" * 72)
 sys.stdout.flush()
 sys.exit(1 if n_fail else 0)

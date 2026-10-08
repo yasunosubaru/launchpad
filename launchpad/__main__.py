@@ -153,16 +153,18 @@ def main() -> int:
         print(f"[Tray] 托盘图标不可用：{win._tray.reason()}"
               f"（仍可用热键唤出：{_hint}）")
 
-    # 触控板手势唤出：系统级低层鼠标钩子。默认启用。
+    # 触控板手势唤出：系统级低层鼠标钩子。**默认关闭**，需在设置里显式打开。
     #
-    # 用户要求「热键太难按，换成纯触摸板手势」。这台机器上四指手势不可用
-    # （通用 HID + 无厂商驱动，SM_DIGITIZER 的 DIGITIZER_TOUCHPAD 未置位），
-    # 两指从侧边划入是唯一可行方案，且实测钩子收得到合成滚轮事件
-    # （delta 规整 ±120）。
+    # 反复开关过两次，两次都被用户报「鼠标滚轮一划就弹出来」推翻。
+    # 第一次以为是把edge_px 判定搞错了（确实是 bug，已修），并把触发带
+    # 从 40px 放宽到 120px；结果**照样误触**。
     #
-    # 之前默认关闭是因为 edge_px 判定被判在了错误的那一格上，导致
-    # 「鼠标滚轮一划就弹」。已修，并把触发带从 40px（屏宽 2.3%，瞄不准）
-    # 放宽到 120px（屏宽 7%）。用户仍然可以随时在设置里关掉。
+    # 真正的理由见 ``settings.SCHEMA`` 里 ``wake_gesture`` 那段注释：
+    # Windows 上两指滑动不移动光标，``WM_MOUSEWHEEL`` 里没有任何字段描述
+    # 手指方向，所以「起点在边缘」测的是「光标碰巧停在边上」，而滚动条
+    # 就在屏幕最右 17px。没有可靠信号能区分触控板轻弹和滚轮快滚。
+    #
+    # 想用的人可以在「设置 → 系统集成 → 触控板手势唤出」打开。
     #
     # 装不上（策略限制、其它程序占用）不是致命错误，打印一句就继续。
     try:
@@ -172,6 +174,11 @@ def main() -> int:
                 on_wake=lambda: win.show_me(),
                 is_showing=lambda: win.is_showing(),
                 flick_delta=120 * settings.get("wake_notches"),
+                # 这条之前没接：settings.json 里存着 wheel_gesture_ms=220，
+                # 程序却一直用构造函数的默认 250ms —— 一个改了没反应的死
+                # 设置。判断依据是启动那行日志里永远印「250ms」，而设置
+                # 里明明是 220。
+                flick_ms=settings.get("wheel_gesture_ms"),
                 edge_px=settings.get("wake_edge_px"))
             # --verbose-wheel 把「起点不在边缘带」也记进日志。默认关，
             # 因为屏幕中间的任何一次正常滚动都会被拒，不静音就刷爆日志。
@@ -182,6 +189,7 @@ def main() -> int:
                 print(f"[WheelHook] 手势唤出已启用：把指针移到屏幕左/右边缘"
                       f" {hook.edge_px}px 内，两指快速划 "
                       f"{settings.get('wake_notches')} 下"
+                      f"（时间窗 {hook.stats()['flick_ms']}ms）"
                       + ("（含逐次拒绝日志）" if hook._verbose else ""))
             else:
                 print("[WheelHook] 未启用：热键/托盘仍可用")
